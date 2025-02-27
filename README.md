@@ -13,7 +13,7 @@ bun dev
 ```
 
 1. **Overview**  
-   The goal is to transform the existing 1-to-1 WebRTC quiz application into a multi-participant quiz platform. This involves both **front-end** (handling multiple questions, storing quizzes in arrays, and displaying them) and **back-end** (signaling server logic to accommodate multiple participants’ offers, answers, and ICE candidates).
+   The goal is to create a multi-participant p2p quiz platform. This involves both **front-end** (handling multiple questions, storing quizzes in arrays, and displaying them) and **back-end** (signaling server logic to accommodate multiple participants’ offers, answers, and ICE candidates).
 
 2. **Multiple Questions — Technical Details & Algorithmic Overview**  
    - **Creator Side**  
