@@ -1,106 +1,187 @@
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 
-// In-memory store for offers and answers (in production, use Redis or similar)
-const connections = new Map<string, {
-  offer?: RTCSessionDescriptionInit;
-  answer?: RTCSessionDescriptionInit;
+// Store connections in memory
+type SessionConnection = {
+  offer: RTCSessionDescriptionInit;
   creatorIce: RTCIceCandidateInit[];
-  participantIce: RTCIceCandidateInit[];
-  lastUpdated: number;
-}>();
+  participants: Map<string, {
+    answer?: RTCSessionDescriptionInit;
+    participantIce: RTCIceCandidateInit[];
+    lastSeen: number; // Add timestamp for tracking activity
+  }>;
+};
 
-// Clean up old sessions (older than 1 hour)
-const cleanup = () => {
+const connections = new Map<string, SessionConnection>();
+
+// Helper to generate session ID
+function generateId(): string {
+  return Math.random().toString(36).substring(2, 10);
+}
+
+// Helper to clean up old sessions (run periodically)
+function cleanupOldSessions() {
   const now = Date.now();
+  const MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
+  
   for (const [sessionId, session] of connections.entries()) {
-    if (now - session.lastUpdated > 3600000) {
+    // Check if this session is too old
+    let allParticipantsInactive = true;
+    
+    for (const [participantId, participant] of session.participants.entries()) {
+      if (now - participant.lastSeen < MAX_AGE) {
+        allParticipantsInactive = false;
+        break;
+      }
+    }
+    
+    if (allParticipantsInactive) {
+      console.log(`Cleaning up inactive session: ${sessionId}`);
       connections.delete(sessionId);
     }
   }
-};
-
-// Create a new quiz session
-export async function POST(request: Request) {
-  try {
-    cleanup();
-    const { offer } = await request.json();
-    const sessionId = Math.random().toString(36).substring(2, 15);
-    
-    connections.set(sessionId, {
-      offer,
-      creatorIce: [],
-      participantIce: [],
-      lastUpdated: Date.now()
-    });
-
-    return NextResponse.json({ sessionId });
-  } catch (error) {
-    console.error('Failed to create session:', error);
-    return NextResponse.json({ error: 'Failed to create session' }, { status: 500 });
-  }
 }
 
-// Get session info or update with answer/ICE candidates
-export async function PUT(request: Request) {
-  try {
-    cleanup();
-    const { sessionId, answer, ice, role } = await request.json();
-    const session = connections.get(sessionId);
+// Run cleanup every hour
+setInterval(cleanupOldSessions, 60 * 60 * 1000);
 
-    if (!session) {
-      return NextResponse.json({ error: 'Session not found' }, { status: 404 });
-    }
+export async function GET(request: NextRequest) {
+  const searchParams = request.nextUrl.searchParams;
+  const sessionId = searchParams.get('session');
+  const participantId = searchParams.get('participant');
 
-    if (answer) {
-      session.answer = answer;
-    }
+  if (!sessionId) {
+    return NextResponse.json({ error: 'Session ID is required' }, { status: 400 });
+  }
 
-    if (ice) {
-      // Avoid duplicate ICE candidates
-      const iceString = JSON.stringify(ice);
-      if (role === 'creator') {
-        if (!session.creatorIce.some(c => JSON.stringify(c) === iceString)) {
-          session.creatorIce.push(ice);
-        }
-      } else {
-        if (!session.participantIce.some(c => JSON.stringify(c) === iceString)) {
-          session.participantIce.push(ice);
-        }
+  const connection = connections.get(sessionId);
+  if (!connection) {
+    return NextResponse.json({ error: 'Session not found' }, { status: 404 });
+  }
+
+  if (participantId) {
+    // If the participant doesn't exist in this session yet, create a new entry
+    if (!connection.participants.has(participantId)) {
+      connection.participants.set(participantId, {
+        participantIce: [],
+        lastSeen: Date.now()
+      });
+    } else {
+      // Update last seen timestamp
+      const participant = connection.participants.get(participantId);
+      if (participant) {
+        participant.lastSeen = Date.now();
+        connection.participants.set(participantId, participant);
       }
     }
-
-    session.lastUpdated = Date.now();
-    connections.set(sessionId, session);
-
-    return NextResponse.json(session);
-  } catch (error) {
-    console.error('Failed to update session:', error);
-    return NextResponse.json({ error: 'Failed to update session' }, { status: 500 });
+    
+    // Return session info for this participant
+    const participant = connection.participants.get(participantId);
+    
+    return NextResponse.json({
+      offer: connection.offer,
+      creatorIce: connection.creatorIce,
+      participant: participant
+    });
+  } else {
+    // Return session info for creator (all participants)
+    const participantsObj: Record<string, any> = {};
+    
+    // Convert Map to object for JSON response
+    for (const [pid, pData] of connection.participants.entries()) {
+      participantsObj[pid] = {
+        answer: pData.answer,
+        participantIce: pData.participantIce,
+        lastSeen: pData.lastSeen
+      };
+    }
+    
+    return NextResponse.json({
+      participants: participantsObj
+    });
   }
 }
 
-// Get session info
-export async function GET(request: Request) {
-  try {
-    cleanup();
-    const { searchParams } = new URL(request.url);
-    const sessionId = searchParams.get('sessionId');
+export async function POST(request: NextRequest) {
+  const body = await request.json();
 
-    if (!sessionId) {
-      return NextResponse.json({ error: 'Session ID required' }, { status: 400 });
-    }
-
-    const session = connections.get(sessionId);
-    if (!session) {
-      return NextResponse.json({ error: 'Session not found' }, { status: 404 });
-    }
-
-    session.lastUpdated = Date.now();
-    connections.set(sessionId, session);
-
-    return NextResponse.json(session);
-  } catch (error) {
-    console.error('Failed to get session:', error);
-    return NextResponse.json({ error: 'Failed to get session' }, { status: 500 });
+  if (!body.offer) {
+    return NextResponse.json({ error: 'Offer is required' }, { status: 400 });
   }
+
+  const sessionId = generateId();
+  
+  connections.set(sessionId, {
+    offer: body.offer,
+    creatorIce: [],
+    participants: new Map()
+  });
+
+  return NextResponse.json({ sessionId });
+}
+
+export async function PUT(request: NextRequest) {
+  const body = await request.json();
+  const { sessionId, participantId, answer, ice, role } = body;
+
+  if (!sessionId) {
+    return NextResponse.json({ error: 'Session ID is required' }, { status: 400 });
+  }
+
+  const connection = connections.get(sessionId);
+  if (!connection) {
+    return NextResponse.json({ error: 'Session not found' }, { status: 404 });
+  }
+
+  // Handle ICE candidates
+  if (ice) {
+    if (role === 'creator') {
+      connection.creatorIce.push(ice);
+    } else if (role === 'participant' && participantId) {
+      // Create participant entry if it doesn't exist
+      if (!connection.participants.has(participantId)) {
+        connection.participants.set(participantId, {
+          participantIce: [ice],
+          lastSeen: Date.now()
+        });
+      } else {
+        const participant = connection.participants.get(participantId);
+        if (participant) {
+          participant.participantIce.push(ice);
+          participant.lastSeen = Date.now();
+          connection.participants.set(participantId, participant);
+        }
+      }
+    } else {
+      return NextResponse.json({ error: 'Invalid role or missing participant ID' }, { status: 400 });
+    }
+  }
+
+  // Handle offer (renegotiation)
+  if (body.offer && role === 'creator') {
+    connection.offer = body.offer;
+    // Clear existing ICE candidates on renegotiation
+    connection.creatorIce = [];
+  }
+
+  // Handle answer
+  if (answer && participantId) {
+    // Allow updating answer for existing participant (reconnection scenario)
+    const existingParticipant = connection.participants.get(participantId);
+    
+    if (existingParticipant) {
+      existingParticipant.answer = answer;
+      existingParticipant.lastSeen = Date.now();
+      // Don't clear ICE candidates on reconnection, they might still be valid
+      connection.participants.set(participantId, existingParticipant);
+    } else {
+      // New participant
+      connection.participants.set(participantId, {
+        answer,
+        participantIce: [],
+        lastSeen: Date.now()
+      });
+    }
+  }
+
+  return NextResponse.json({ success: true });
 } 
