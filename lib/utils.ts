@@ -2,11 +2,16 @@
 export async function getHostAddress(): Promise<string> {
   try {
     // Try to get the IP from the server 
-    const response = await fetch('/api/ip');
-    if (response.ok) {
-      const data = await response.json();
-      return data.address; // Will be something like "192.168.1.106:3000"
-    } 
+    if (process.env.NODE_ENV === 'development') {
+      const response = await fetch('/api/ip');
+      if (response.ok) {
+        const data = await response.json();
+        return data.address; // Will be something like "192.168.1.106:3000"
+      }
+    }
+    else {
+      return window.location.host;
+    }
   } catch (error) {
     console.error('Failed to get host address:', error);
   }

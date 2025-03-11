@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, Suspense } from 'react';
 import { createConnection, joinConnection, pollUpdates } from '@/lib/p2p';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { Inter } from 'next/font/google';
@@ -42,7 +42,7 @@ interface DraftQuiz {
   points: number;
 }
 
-export default function HomePage() {
+function HomeContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
 
@@ -806,13 +806,13 @@ export default function HomePage() {
                     <input
                       readOnly
                       className="flex-1 px-4 py-3 bg-white border-2 border-indigo-300 rounded-lg shadow-sm text-indigo-900 font-medium"
-                      value={hostAddress ? `http://${hostAddress}/?session=${creatorSessionId}` : 'Loading link...'}
+                      value={hostAddress ? `${hostAddress}/?session=${creatorSessionId}` : 'Loading link...'}
                     />
                     <button
                       onClick={() => {
                         if (hostAddress) {
                           navigator.clipboard.writeText(
-                            `http://${hostAddress}/?session=${creatorSessionId}`
+                            `${hostAddress}/?session=${creatorSessionId}`
                           );
                           alert('Link copied!');
                         }
@@ -838,7 +838,7 @@ export default function HomePage() {
                   <p className="text-sm font-medium text-indigo-700 mb-3">Or scan QR code:</p>
                   {hostAddress ? (
                     <QRCodeSVG 
-                      value={`http://${hostAddress}/?session=${creatorSessionId}`}
+                      value={`${hostAddress}/?session=${creatorSessionId}`}
                       size={150}
                       bgColor={"#ffffff"}
                       fgColor={"#4f46e5"}
@@ -1329,5 +1329,20 @@ export default function HomePage() {
         </footer>
       </div>
     </main>
+  );
+}
+
+export default function HomePage() {
+  return (
+    <Suspense fallback={
+      <div className="min-h-screen p-4 md:p-8 bg-gradient-to-br from-indigo-50 via-indigo-100 to-white flex items-center justify-center">
+        <div className="text-center">
+          <div className="inline-block animate-spin rounded-full h-10 w-10 border-4 border-indigo-300 border-t-indigo-600 mb-4"></div>
+          <p className="text-indigo-800 font-medium text-lg">Loading...</p>
+        </div>
+      </div>
+    }>
+      <HomeContent />
+    </Suspense>
   );
 }
