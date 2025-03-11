@@ -841,7 +841,7 @@ export async function joinConnection(sessionId: string, participantId: string) {
           .then(() => {
             // Send answer to signaling server
             console.log("[Participant] Sending answer to signaling server");
-            return fetch(`http://${hostAddress}/api/signal`, {
+            return fetch(`https://${hostAddress}/api/signal`, {
               method: 'PUT',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ 
@@ -934,7 +934,7 @@ export async function joinConnection(sessionId: string, participantId: string) {
       if (event.candidate) {
         console.log("[Participant] New ICE candidate");
         try {
-          const response = await fetch(`http://${hostAddress}/api/signal`, {
+          const response = await fetch(`https://${hostAddress}/api/signal`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -1080,7 +1080,7 @@ export async function pollUpdates(
       if (role === 'participant') {
         // Participants need the full URL with host for cross-device communication
         // Always use the full URL with host address for participants
-        url = new URL(`http://${hostAddress}/api/signal`);
+        url = new URL(`https://${hostAddress}/api/signal`);
       } else {
         // Creators can use relative URLs since they're on the same device as the server
         url = new URL('/api/signal', window.location.origin);
