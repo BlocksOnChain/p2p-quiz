@@ -1,8 +1,8 @@
 'use client';
 
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, Suspense } from 'react';
 import { createConnection, joinConnection, pollUpdates } from '@/lib/p2p';
-import { useSearchParams, useRouter } from 'next/navigation';
+import { useSearchParams } from 'next/navigation';
 import { Inter } from 'next/font/google';
 import { QRCodeSVG } from 'qrcode.react';
 import { getHostAddress } from '@/lib/utils';
@@ -14,6 +14,7 @@ interface QuizMessage {
   type: 'quiz' | 'answer' | 'info' | 'heartbeat';
   payload: string;
   participantId?: string;
+  [key: string]: unknown; // Add index signature to make it compatible with our type
 }
 
 interface Quiz {
@@ -43,14 +44,21 @@ interface DraftQuiz {
 }
 
 export default function HomePage() {
+  return (
+    <Suspense fallback={<div className="flex items-center justify-center min-h-screen">Loading...</div>}>
+      <HomePageContent />
+    </Suspense>
+  );
+}
+
+function HomePageContent() {
   const searchParams = useSearchParams();
-  const router = useRouter();
 
   // Get mode and session ID from URL
   const sessionId = searchParams.get('session');
   const initialMode = sessionId ? 'participant' : 'creator';
 
-  const [mode, setMode] = useState<'creator' | 'participant'>(initialMode);
+  const [mode, setMode] = useState<string>(initialMode);
   const [connectionStatus, setConnectionStatus] = useState<string>('disconnected');
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -76,14 +84,13 @@ export default function HomePage() {
 
   // Add state for draft questions
   const [draftQuizzes, setDraftQuizzes] = useState<DraftQuiz[]>([]);
-  const [isEditing, setIsEditing] = useState(false);
 
   // Add new state for tracking message delivery status
   const [messageSendingStatus, setMessageSendingStatus] = useState<'idle' | 'sending' | 'sent' | 'failed'>('idle');
   const [heartbeatStatus, setHeartbeatStatus] = useState<'connected' | 'reconnecting' | 'disconnected'>('disconnected');
   const heartbeatIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastHeartbeatResponseRef = useRef<number>(0);
-  const reliableSenderRef = useRef<((data: any) => string | null) | null>(null);
+  const reliableSenderRef = useRef<((data: { type: string; [key: string]: unknown }) => string | null) | null>(null);
 
   // Add a new state for host address
   const [hostAddress, setHostAddress] = useState<string>('');
@@ -101,7 +108,7 @@ export default function HomePage() {
   }, []);
 
   // Function to start heartbeat mechanism
-  const startHeartbeat = useCallback((channel: RTCDataChannel, sendReliable?: (data: any) => string | null) => {
+  const startHeartbeat = useCallback((channel: RTCDataChannel, sendReliable?: (data: { type: string; [key: string]: unknown }) => string | null) => {
     if (heartbeatIntervalRef.current) {
       clearInterval(heartbeatIntervalRef.current);
     }
@@ -401,121 +408,166 @@ export default function HomePage() {
   const [receivedQuizzes, setReceivedQuizzes] = useState<Quiz[]>([]);
   const [currentQuizId, setCurrentQuizId] = useState<string | null>(null);
   const [myAnswers, setMyAnswers] = useState<Map<string, string>>(new Map());
-  const [participantId] = useState(() => Math.random().toString(36).substring(2));
+  const [participantId, setParticipantId] = useState(() => Math.random().toString(36).substring(2));
 
   const participantPeerRef = useRef<RTCPeerConnection | null>(null);
   const participantChannelRef = useRef<RTCDataChannel | null>(null);
+
+  // Generate a unique participant ID
+  const generateParticipantId = () => {
+    return Math.random().toString(36).substring(2);
+  };
+
+  // Participant: join the quiz
+  const handleJoinQuiz = async (sid: string) => {
+    setError(null);
+    setIsLoading(true);
+    try {
+      console.log(`Joining session ${sid}`);
+      const participantId = generateParticipantId();
+      
+      // Set participant ID in state
+      setParticipantId(participantId);
+      
+      // Connect to the quiz
+      const { participantPeer, getChannel, sendReliableMessage } = await joinConnection(sid, participantId);
+      
+      // Store the connection and peer
+      participantPeerRef.current = participantPeer;
+      reliableSenderRef.current = sendReliableMessage;
+      
+      // Start polling for updates
+      pollUpdates(sid, 'participant', participantPeer, participantId);
+      
+      try {
+        const channel = await getChannel();
+        if (channel) {
+          participantChannelRef.current = channel;
+          setupDataChannel(channel);
+          startHeartbeat(channel, sendReliableMessage);
+        }
+      } catch (err) {
+        console.error('Failed to get data channel:', err);
+        setError('Failed to establish communication channel');
+      }
+      
+      // Ensure we're in participant mode
+      setMode('participant');
+    } catch (err) {
+      console.error('Failed to join quiz:', err);
+      setError('Failed to connect to the quiz');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Handle time up for a quiz
+  const handleTimeUp = (quizId: string) => {
+    if (!myAnswers.has(quizId)) {
+      handleSendAnswer(quizId, true);
+    }
+  };
+
+  // Update answer handling to use reliable messaging
+  const handleSendAnswer = (quizId: string, isTimeUp: boolean = false) => {
+    if (!participantChannelRef.current || participantChannelRef.current.readyState !== 'open') {
+      alert('Connection not ready yet!');
+      return;
+    }
+
+    // Check if we've already submitted an answer and it's in the scores map
+    if (scores.has(quizId)) {
+      console.log(`Answer for quiz ${quizId} already submitted, ignoring duplicate submission`);
+      return;
+    }
+
+    const answer = myAnswers.get(quizId) || '';
+    if (!isTimeUp && !answer.trim()) {
+      alert('Please enter an answer!');
+      return;
+    }
+
+    const quiz = receivedQuizzes.find(q => q.id === quizId);
+    if (!quiz) return;
+
+    const timeTaken = Math.floor((Date.now() - quiz.timestamp) / 1000);
+    const isCorrect = answer.toLowerCase().trim() === quiz.correctAnswer.toLowerCase().trim();
+    const score = isCorrect ? 
+      Math.max(0, quiz.points || 0) * (quiz.timeLimit ? Math.max(0, (quiz.timeLimit - timeTaken) / quiz.timeLimit) : 1) 
+      : 0;
+
+    const msg: QuizMessage = {
+      type: 'answer',
+      participantId,
+      payload: JSON.stringify({
+        quizId,
+        answer,
+        timeTaken,
+        score
+      })
+    };
+
+    setMessageSendingStatus('sending');
+    
+    try {
+      // Use reliable messaging if available
+      let messageId = null;
+      if (reliableSenderRef.current) {
+        messageId = reliableSenderRef.current(msg);
+      } else {
+        participantChannelRef.current.send(JSON.stringify(msg));
+      }
+      
+      // Immediately record this score to prevent duplicate submissions
+      setScores(prev => new Map(prev).set(quizId, score));
+      
+      // Store the message ID to prevent duplicate submissions
+      if (messageId) {
+        console.log(`Sent answer for quiz ${quizId} with message ID ${messageId}`);
+      }
+      
+      setMessageSendingStatus('sent');
+      setTimeout(() => setMessageSendingStatus('idle'), 2000);
+      
+    } catch (err) {
+      console.error('Error sending answer:', err);
+      setMessageSendingStatus('failed');
+      if (!isTimeUp) {
+        alert('Failed to send answer');
+      }
+    }
+  };
 
   // Join quiz when session ID is present
   useEffect(() => {
     if (sessionId && mode === 'participant') {
       handleJoinQuiz(sessionId);
     }
-  }, [sessionId, mode]);
+  }, [sessionId, mode, handleJoinQuiz]);
+  
+  // Remaining effect for timer
+  useEffect(() => {
+    if (mode === 'participant' && currentQuizId) {
+      const quiz = receivedQuizzes.find(q => q.id === currentQuizId);
+      if (!quiz || myAnswers.has(quiz.id)) return;
 
-  // Participant: join the quiz
-  const handleJoinQuiz = async (sid: string) => {
-    setError(null);
-    setIsLoading(true);
-    
-    // Clear any existing state to ensure fresh connection
-    if (participantPeerRef.current) {
-      try {
-        participantPeerRef.current.close();
-      } catch (err) {
-        console.log("Error closing existing peer connection:", err);
-      }
-      participantPeerRef.current = null;
-    }
-    
-    if (participantChannelRef.current) {
-      try {
-        participantChannelRef.current.close();
-      } catch (err) {
-        console.log("Error closing existing data channel:", err);
-      }
-      participantChannelRef.current = null;
-    }
-    
-    // Reset connection states
-    setConnectionStatus('connecting');
-    setHeartbeatStatus('disconnected');
-    
-    try {
-      const { participantPeer, getChannel, sendReliableMessage } = await joinConnection(sid, participantId);
-      participantPeerRef.current = participantPeer;
-      
-      // Store reliable sender
-      reliableSenderRef.current = sendReliableMessage;
-
-      // Monitor connection state with more detailed logging
-      participantPeer.onconnectionstatechange = () => {
-        const state = participantPeer.connectionState;
-        console.log("[Participant Frontend] Connection state changed:", state);
-        setConnectionStatus(state);
-        
-        // Only update error if we're disconnected and not in a temporary state
-        if (state === 'failed' || state === 'closed') {
-          setError('Connection lost. Please try reconnecting.');
-        } else if (state === 'connected') {
-          console.log("[Participant Frontend] Successfully connected to creator");
-          // Clear any existing error on successful connection
-          setError(null);
-        }
-      };
-
-      // Check if the data channel is available immediately
-      try {
-        const channel = getChannel();
-        if (channel) {
-          console.log("[Participant Frontend] Data channel available immediately");
-          setupDataChannel(channel);
-          
-          // Start heartbeat mechanism
-          startHeartbeat(channel, sendReliableMessage);
+      const startTime = Date.now();
+      const timer = setInterval(() => {
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        if (quiz.timeLimit && elapsed >= quiz.timeLimit) {
+          clearInterval(timer);
+          handleTimeUp(quiz.id);
         } else {
-          console.log("[Participant Frontend] Waiting for data channel...");
-          // Setup data channel after connection
-          let retries = 0;
-          const maxRetries = 20;
-          const interval = setInterval(() => {
-            try {
-              const newChannel = getChannel();
-              if (newChannel) {
-                console.log("[Participant Frontend] Data channel obtained after retry");
-                clearInterval(interval);
-                setupDataChannel(newChannel);
-                
-                // Start heartbeat mechanism
-                startHeartbeat(newChannel, sendReliableMessage);
-              } else if (retries++ >= maxRetries) {
-                clearInterval(interval);
-                setError('Failed to establish data channel. Please try reconnecting.');
-                console.error("[Participant Frontend] Failed to get data channel after max retries");
-              }
-            } catch (err) {
-              console.error("[Participant Frontend] Error getting channel during retry:", err);
-              if (retries++ >= maxRetries) {
-                clearInterval(interval);
-                setError('Failed to establish data channel. Please try reconnecting.');
-              }
-            }
-          }, 500);
+          setQuizTimer(quiz.timeLimit ? quiz.timeLimit - elapsed : null);
         }
-      } catch (err) {
-        console.error("[Participant Frontend] Error getting initial data channel:", err);
-        // Continue anyway as the channel might become available during polling
-      }
+      }, 1000);
 
-      // Start polling for updates
-      pollUpdates(sid, 'participant', participantPeer, participantId);
-    } catch (err) {
-      console.error("[Participant Frontend] Error joining quiz:", err);
-      setError('Failed to join quiz session. The session may be invalid or expired.');
-    } finally {
-      setIsLoading(false);
+      return () => {
+        clearInterval(timer);
+        setQuizTimer(null);
+      };
     }
-  };
+  }, [currentQuizId, mode, myAnswers, receivedQuizzes, handleTimeUp]);
 
   // Helper function to setup data channel
   const setupDataChannel = (channel: RTCDataChannel) => {
@@ -614,107 +666,6 @@ export default function HomePage() {
         console.error("[Participant Frontend] Failed to parse message:", err);
       }
     };
-  };
-
-  // Add timer functionality for participants
-  useEffect(() => {
-    if (mode === 'participant' && currentQuizId) {
-      const quiz = receivedQuizzes.find(q => q.id === currentQuizId);
-      if (!quiz || myAnswers.has(quiz.id)) return;
-
-      const startTime = Date.now();
-      const timer = setInterval(() => {
-        const elapsed = Math.floor((Date.now() - startTime) / 1000);
-        if (quiz.timeLimit && elapsed >= quiz.timeLimit) {
-          clearInterval(timer);
-          handleTimeUp(quiz.id);
-        } else {
-          setQuizTimer(quiz.timeLimit ? quiz.timeLimit - elapsed : null);
-        }
-      }, 1000);
-
-      return () => {
-        clearInterval(timer);
-        setQuizTimer(null);
-      };
-    }
-  }, [currentQuizId, mode, myAnswers, receivedQuizzes]);
-
-  // Handle time up for a quiz
-  const handleTimeUp = (quizId: string) => {
-    if (!myAnswers.has(quizId)) {
-      handleSendAnswer(quizId, true);
-    }
-  };
-
-  // Update answer handling to use reliable messaging
-  const handleSendAnswer = (quizId: string, isTimeUp: boolean = false) => {
-    if (!participantChannelRef.current || participantChannelRef.current.readyState !== 'open') {
-      alert('Connection not ready yet!');
-      return;
-    }
-
-    // Check if we've already submitted an answer and it's in the scores map
-    if (scores.has(quizId)) {
-      console.log(`Answer for quiz ${quizId} already submitted, ignoring duplicate submission`);
-      return;
-    }
-
-    const answer = myAnswers.get(quizId) || '';
-    if (!isTimeUp && !answer.trim()) {
-      alert('Please enter an answer!');
-      return;
-    }
-
-    const quiz = receivedQuizzes.find(q => q.id === quizId);
-    if (!quiz) return;
-
-    const timeTaken = Math.floor((Date.now() - quiz.timestamp) / 1000);
-    const isCorrect = answer.toLowerCase().trim() === quiz.correctAnswer.toLowerCase().trim();
-    const score = isCorrect ? 
-      Math.max(0, quiz.points || 0) * (quiz.timeLimit ? Math.max(0, (quiz.timeLimit - timeTaken) / quiz.timeLimit) : 1) 
-      : 0;
-
-    const msg: QuizMessage = {
-      type: 'answer',
-      participantId,
-      payload: JSON.stringify({
-        quizId,
-        answer,
-        timeTaken,
-        score
-      })
-    };
-
-    setMessageSendingStatus('sending');
-    
-    try {
-      // Use reliable messaging if available
-      let messageId = null;
-      if (reliableSenderRef.current) {
-        messageId = reliableSenderRef.current(msg);
-      } else {
-        participantChannelRef.current.send(JSON.stringify(msg));
-      }
-      
-      // Immediately record this score to prevent duplicate submissions
-      setScores(prev => new Map(prev).set(quizId, score));
-      
-      // Store the message ID to prevent duplicate submissions
-      if (messageId) {
-        console.log(`Sent answer for quiz ${quizId} with message ID ${messageId}`);
-      }
-      
-      setMessageSendingStatus('sent');
-      setTimeout(() => setMessageSendingStatus('idle'), 2000);
-      
-    } catch (err) {
-      console.error('Error sending answer:', err);
-      setMessageSendingStatus('failed');
-      if (!isTimeUp) {
-        alert('Failed to send answer');
-      }
-    }
   };
 
   // Get current quiz

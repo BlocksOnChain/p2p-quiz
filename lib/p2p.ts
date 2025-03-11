@@ -58,7 +58,7 @@ class MessageQueue {
                 this.pendingMessages.delete(msgId);
               }
             }
-          } catch (err) {
+          } catch (_) {
             // Skip if we can't parse the message
           }
         }
@@ -66,7 +66,7 @@ class MessageQueue {
         // Mark this quiz as having a submitted answer
         this.submittedAnswers.add(quizId);
       }
-    } catch (err) {
+    } catch (_) {
       // Not JSON or couldn't parse, continue with normal processing
     }
     
@@ -85,7 +85,7 @@ class MessageQueue {
           return parsedData.messageId;
         }
       }
-    } catch (err) {
+    } catch (_) {
       // Not JSON or couldn't parse, continue with normal processing
     }
     
@@ -144,7 +144,7 @@ class MessageQueue {
           return false;
         }
       }
-    } catch (err) {
+    } catch (_) {
       // Not JSON or couldn't parse, continue with normal processing
     }
     
@@ -180,7 +180,7 @@ class MessageQueue {
           this.pendingMessages.delete(id);
           this.queue.delete(id);
         }
-      } catch (err) {
+      } catch (_) {
         // If parsing fails, just send without logging
       }
       
@@ -196,7 +196,7 @@ class MessageQueue {
         } else if (parsedData.type === 'ack') {
           timeoutDuration = 500; // Very short timeout for ACKs (0.5 seconds)
         }
-      } catch (err) {
+      } catch (_) {
         // Use default timeout if parsing fails
       }
       
@@ -209,7 +209,7 @@ class MessageQueue {
             if (parsedData.type !== 'ack') {
               console.log(`[MessageQueue] Message ${parsedData.type} timed out, will retry`);
             }
-          } catch (err) {
+          } catch (_) {
             // If we can't parse, assume it's not an ACK and log
             console.log(`[MessageQueue] Message timed out, will retry`);
           }
@@ -227,15 +227,15 @@ class MessageQueue {
               console.log(`[MessageQueue] Marking quiz ${quizId} as completed after timeout`);
               this.queue.delete(id);
             }
-          } catch (err) {
+          } catch (_) {
             // Not JSON or couldn't parse, continue with normal processing
           }
         }
       }, timeoutDuration);
       
       return true;
-    } catch (err) {
-      console.error(`[MessageQueue] Error sending message:`, err);
+    } catch (_) {
+      console.error(`[MessageQueue] Error sending message:`, _);
       this.pendingMessages.delete(id);
       return false;
     }
@@ -271,12 +271,12 @@ class MessageQueue {
                   this.pendingMessages.delete(msgId);
                 }
               }
-            } catch (err) {
+            } catch (_) {
               // Skip if we can't parse the message
             }
           }
         }
-      } catch (err) {
+      } catch (_) {
         // Not JSON or couldn't parse, continue with normal processing
       }
     }
@@ -307,7 +307,7 @@ class MessageQueue {
         let nonAckCount = 0;
         let hasAnswerMessages = false;
         
-        for (const [_, message] of this.queue.entries()) {
+        for (const [, message] of this.queue.entries()) {
           try {
             const parsedData = JSON.parse(message.data);
             if (parsedData.type !== 'ack') {
@@ -316,7 +316,7 @@ class MessageQueue {
                 hasAnswerMessages = true;
               }
             }
-          } catch (err) {
+          } catch (_) {
             nonAckCount++; // If we can't parse, count it
           }
         }
@@ -344,7 +344,7 @@ class MessageQueue {
               if (parsedData.type !== 'ack') {
                 console.log(`[MessageQueue] Max attempts reached for ${parsedData.type} message, dropping`);
               }
-            } catch (err) {
+            } catch (_) {
               // If we can't parse, just log generic message
               console.log(`[MessageQueue] Max attempts reached for message, dropping`);
             }
@@ -442,8 +442,8 @@ export async function createConnection() {
             protocol: 'quiz'
           });
           Object.assign(dataChannel, newDataChannel);
-        } catch (err) {
-          console.error("[Creator] Failed to recreate data channel:", err);
+        } catch (_) {
+          console.error("[Creator] Failed to recreate data channel:", _);
         }
       }
     };
@@ -460,8 +460,8 @@ export async function createConnection() {
             protocol: 'quiz'
           });
           Object.assign(dataChannel, newDataChannel);
-        } catch (err) {
-          console.error("[Creator] Failed to reopen data channel:", err);
+        } catch (_) {
+          console.error("[Creator] Failed to reopen data channel:", _);
         }
       }
     };
@@ -534,8 +534,8 @@ export async function createConnection() {
             }
           }
         }
-      } catch (err) {
-        console.error('[Creator] Error processing message:', err);
+      } catch (_) {
+        console.error('[Creator] Error processing message:', _);
       }
     };
   
@@ -556,8 +556,8 @@ export async function createConnection() {
           if (!response.ok) {
             console.error("[Creator] Failed to send ICE candidate");
           }
-        } catch (err) {
-          console.error("[Creator] Error sending ICE candidate:", err);
+        } catch (_) {
+          console.error("[Creator] Error sending ICE candidate:", _);
         }
       } else {
         console.log("[Creator] ICE gathering complete");
@@ -565,7 +565,7 @@ export async function createConnection() {
     };
   
     // Enhanced connection state monitoring
-    let connectionMonitorInterval: NodeJS.Timeout | null = null;
+    let connectionMonitorInterval: ReturnType<typeof setInterval> | null = null;
     let lastStateChange = Date.now();
     const MAX_STATE_DURATION = 10000; // 10 seconds
 
@@ -610,8 +610,8 @@ export async function createConnection() {
           
           console.log("[Creator] Recovery offer sent successfully");
           lastStateChange = Date.now(); // Reset the timer
-        } catch (err) {
-          console.error("[Creator] Recovery attempt failed:", err);
+        } catch (_) {
+          console.error("[Creator] Recovery attempt failed:", _);
         }
       }
     };
@@ -638,7 +638,7 @@ export async function createConnection() {
       creatorPeer, 
       dataChannel, 
       sessionId,
-      sendReliableMessage: (data: any) => {
+      sendReliableMessage: (data: { type?: string; [key: string]: unknown }) => {
         const type = data.type || 'unknown';
         console.log(`[Creator] Preparing to send message of type: ${type}`);
         
@@ -695,11 +695,6 @@ export async function joinConnection(sessionId: string, participantId: string) {
     
     const participantPeer = new RTCPeerConnection(getICEConfiguration());
     
-    // Enhanced connection monitoring for participant
-    let connectionMonitorInterval: NodeJS.Timeout | null = null;
-    let lastStateChange = Date.now();
-    const MAX_STATE_DURATION = 10000; // 10 seconds
-
     // Get the host address dynamically
     const hostAddress = await getHostAddress();
     
@@ -794,8 +789,8 @@ export async function joinConnection(sessionId: string, participantId: string) {
                       }
                     }
                   }
-                } catch (err) {
-                  console.error('[Participant] Error processing message:', err);
+                } catch (_) {
+                  console.error('[Participant] Error processing message:', _);
                 }
               };
 
@@ -814,8 +809,8 @@ export async function joinConnection(sessionId: string, participantId: string) {
                 clearTimeout(timeout);
                 resolve(channel);
               }
-            } catch (err) {
-              console.error("[Participant] Failed to create data channel:", err);
+            } catch (_) {
+              console.error("[Participant] Failed to create data channel:", _);
               // Continue - we'll try with ondatachannel as backup
             }
             
@@ -834,7 +829,7 @@ export async function joinConnection(sessionId: string, participantId: string) {
               console.log("[Participant] Adding existing ICE candidates:", session.creatorIce.length);
               return Promise.all(session.creatorIce.map((ice: RTCIceCandidateInit) => {
                 return participantPeer.addIceCandidate(new RTCIceCandidate(ice))
-                  .catch(err => console.error('[Participant] Failed to add ICE candidate:', err));
+                  .catch(_ => console.error('[Participant] Failed to add ICE candidate:', _));
               }));
             }
           })
@@ -857,14 +852,14 @@ export async function joinConnection(sessionId: string, participantId: string) {
             }
             console.log("[Participant] Answer sent successfully");
           })
-          .catch(err => {
-            console.error("[Participant] Error in connection setup:", err);
-            reject(err);
+          .catch(_ => {
+            console.error("[Participant] Error in connection setup:", _);
+            reject(_);
           });
-      } catch (err) {
-        console.error("[Participant] Error in connection initialization:", err);
+      } catch (_) {
+        console.error("[Participant] Error in connection initialization:", _);
         clearTimeout(timeout);
-        reject(err);
+        reject(_);
       }
 
       // Also listen for ondatachannel event as fallback
@@ -922,8 +917,8 @@ export async function joinConnection(sessionId: string, participantId: string) {
                 }
               }
             }
-          } catch (err) {
-            console.error('[Participant] Error processing message on backup channel:', err);
+          } catch (_) {
+            console.error('[Participant] Error processing message on backup channel:', _);
           }
         };
       };
@@ -947,8 +942,8 @@ export async function joinConnection(sessionId: string, participantId: string) {
           if (!response.ok) {
             console.error("[Participant] Failed to send ICE candidate");
           }
-        } catch (err) {
-          console.error("[Participant] Error sending ICE candidate:", err);
+        } catch (_) {
+          console.error("[Participant] Error sending ICE candidate:", _);
         }
       } else {
         console.log("[Participant] ICE gathering complete");
@@ -969,7 +964,7 @@ export async function joinConnection(sessionId: string, participantId: string) {
       return {
         participantPeer,
         getChannel: () => channel,
-        sendReliableMessage: (data: any) => {
+        sendReliableMessage: (data: { type?: string; [key: string]: unknown }) => {
           if (!messageQueue) {
             console.error('[Participant] Cannot send message, no message queue available');
             return null;
@@ -978,9 +973,9 @@ export async function joinConnection(sessionId: string, participantId: string) {
           let type = 'unknown';
           try {
             if (typeof data === 'object' && data !== null && 'type' in data) {
-              type = data.type;
+              type = data.type || 'unknown';
             }
-          } catch (e) {
+          } catch (_) {
             // Ignore any errors in type extraction
           }
           
@@ -1022,9 +1017,9 @@ export async function joinConnection(sessionId: string, participantId: string) {
           return messageQueue.enqueue(messageString);
         }
       };
-    } catch (error) {
-      console.error("[Participant] Failed to establish data channel:", error);
-      throw error;
+    } catch (_) {
+      console.error("[Participant] Failed to establish data channel:", _);
+      throw _;
     }
 }
   
@@ -1042,14 +1037,14 @@ export async function pollUpdates(
   peer: RTCPeerConnection,
   participantId?: string
 ) {
-  let processedIceCandidates = new Set<string>();
+  const processedIceCandidates = new Set<string>();
   let pendingIceCandidates: RTCIceCandidateInit[] = [];
   let hostAddress = typeof window !== 'undefined' ? window.location.host : 'localhost:3000';
   
   // Try to get the host address for better cross-device communication
   try {
     hostAddress = await getHostAddress();
-  } catch (err) {
+  } catch (_) {
     console.warn("Could not get host address for API calls, using default");
   }
 
@@ -1103,9 +1098,9 @@ export async function pollUpdates(
         try {
           // Try to get response text for more context
           responseText = await response.text();
-        } catch (textError) {
+        } catch (_) {
           // If we can't get the response text, just continue
-          console.warn(`[${role}] Could not read response text:`, textError);
+          console.warn(`[${role}] Could not read response text:`, _);
         }
         
         throw new Error(
@@ -1122,7 +1117,7 @@ export async function pollUpdates(
 
       if (role === 'creator' && session.participants) {
         // Handle new participants and their ICE candidates
-        for (const [pid, participant] of Object.entries<{
+        for (const [, participant] of Object.entries<{
           answer?: RTCSessionDescriptionInit;
           participantIce: RTCIceCandidateInit[];
         }>(session.participants)) {
@@ -1137,13 +1132,13 @@ export async function pollUpdates(
                 try {
                   await peer.addIceCandidate(new RTCIceCandidate(ice));
                   processedIceCandidates.add(JSON.stringify(ice));
-                } catch (err) {
-                  console.error('[Creator] Failed to add pending ICE candidate:', err);
+                } catch (_) {
+                  console.error('[Creator] Failed to add pending ICE candidate:', _);
                 }
               }
               pendingIceCandidates = [];
-            } catch (err) {
-              console.error('[Creator] Failed to set remote description:', err);
+            } catch (_) {
+              console.error('[Creator] Failed to set remote description:', _);
               continue;
             }
           }
@@ -1161,8 +1156,8 @@ export async function pollUpdates(
                   try {
                     await peer.addIceCandidate(new RTCIceCandidate(ice));
                     processedIceCandidates.add(iceString);
-                  } catch (err) {
-                    console.error('[Creator] Failed to add ICE candidate:', err);
+                  } catch (_) {
+                    console.error('[Creator] Failed to add ICE candidate:', _);
                   }
                 }
               }
@@ -1181,8 +1176,8 @@ export async function pollUpdates(
               try {
                 await peer.addIceCandidate(new RTCIceCandidate(ice));
                 processedIceCandidates.add(iceString);
-              } catch (err) {
-                console.error('[Participant] Failed to add ICE candidate:', err);
+              } catch (_) {
+                console.error('[Participant] Failed to add ICE candidate:', _);
               }
             }
           }
@@ -1194,11 +1189,11 @@ export async function pollUpdates(
         console.log(`[${role}] Connection fully established, stopping polling`);
         clearInterval(interval);
       }
-    } catch (error) {
+    } catch (_) {
       // Increment failure counter
       consecutiveFailures++;
       
-      console.error(`[${role}] Error polling updates (failure #${consecutiveFailures}):`, error);
+      console.error(`[${role}] Error polling updates (failure #${consecutiveFailures}):`, _);
       
       // Add retry logic when connection issues occur
       if (peer.connectionState !== 'connected') {
