@@ -1,7 +1,5 @@
-// Add this at the top of the file, below existing imports
 import { getHostAddress } from './utils';
 
-// Message queue for reliable message delivery
 interface QueuedMessage {
   id: string;
   data: string;
@@ -16,9 +14,10 @@ class MessageQueue {
   private pendingMessages: Set<string> = new Set();
   private retryInterval: ReturnType<typeof setInterval> | null = null;
   private maxRetryInterval = 5000; // Max 5 seconds between retries
-  private acknowledgedMessages: Set<string> = new Set(); // Track messages that have been acknowledged
-  // NEW: Track messages by their original messageId (not queue ID)
+  private acknowledgedMessages: Set<string> = new Set();
   private messageIdToQueueId: Map<string, string> = new Map();
+  private submittedAnswers: Set<string> = new Set(); // Track submitted answers by quizId
+  private completedQuizzes: Set<string> = new Set(); // NEW: Track fully completed quizzes
   
   constructor(channel: RTCDataChannel) {
     this.channel = channel;
@@ -27,6 +26,50 @@ class MessageQueue {
   
   // Enqueue a message for sending
   enqueue(data: string, maxAttempts = 5): string {
+    try {
+      const parsedData = JSON.parse(data);
+      
+      // Special handling for answer messages to prevent duplicates
+      if (parsedData.type === 'answer') {
+        const answerData = JSON.parse(parsedData.payload);
+        const quizId = answerData.quizId;
+        
+        // If this quiz is marked as completed, don't send any more messages for it
+        if (this.completedQuizzes.has(quizId)) {
+          console.log(`[MessageQueue] Quiz ${quizId} is completed, ignoring new messages`);
+          return '';
+        }
+        
+        // If we've already submitted an answer for this quiz, don't submit again
+        if (this.submittedAnswers.has(quizId)) {
+          console.log(`[MessageQueue] Answer already submitted for quiz ${quizId}, ignoring duplicate`);
+          return '';
+        }
+        
+        // Remove any existing answer messages for this quiz from the queue
+        for (const [msgId, msg] of this.queue.entries()) {
+          try {
+            const existingData = JSON.parse(msg.data);
+            if (existingData.type === 'answer') {
+              const existingAnswer = JSON.parse(existingData.payload);
+              if (existingAnswer.quizId === quizId) {
+                console.log(`[MessageQueue] Removing old answer message for quiz ${quizId}`);
+                this.queue.delete(msgId);
+                this.pendingMessages.delete(msgId);
+              }
+            }
+          } catch (err) {
+            // Skip if we can't parse the message
+          }
+        }
+        
+        // Mark this quiz as having a submitted answer
+        this.submittedAnswers.add(quizId);
+      }
+    } catch (err) {
+      // Not JSON or couldn't parse, continue with normal processing
+    }
+    
     const id = Math.random().toString(36).substring(2);
     
     // Parse the message to extract original ID if it exists
@@ -63,14 +106,13 @@ class MessageQueue {
   private trySend(id: string): boolean {
     // Check if message is already acknowledged
     if (this.acknowledgedMessages.has(id)) {
-      console.log(`[MessageQueue] Message ${id} was already acknowledged, removing from queue`);
+      // Remove silently
       this.queue.delete(id);
       return true;
     }
     
     // Check if channel is open
     if (this.channel.readyState !== 'open') {
-      console.log(`[MessageQueue] Channel not open, keeping message ${id} in queue`);
       return false;
     }
     
@@ -80,13 +122,35 @@ class MessageQueue {
     
     // Check if message is already pending acknowledgment
     if (this.pendingMessages.has(id)) {
-      console.log(`[MessageQueue] Message ${id} is already pending ACK, not resending yet`);
       return false;
+    }
+    
+    try {
+      const parsedData = JSON.parse(message.data);
+      if (parsedData.type === 'answer') {
+        const answerData = JSON.parse(parsedData.payload);
+        const quizId = answerData.quizId;
+        
+        // If this quiz is completed, remove the message and don't send
+        if (this.completedQuizzes.has(quizId)) {
+          this.queue.delete(id);
+          return false;
+        }
+        
+        // If this answer has been attempted more than once, don't retry
+        if (message.attempts > 0) {
+          console.log(`[MessageQueue] Answer for quiz ${quizId} already attempted, removing from queue`);
+          this.queue.delete(id);
+          return false;
+        }
+      }
+    } catch (err) {
+      // Not JSON or couldn't parse, continue with normal processing
     }
     
     // Only attempt to send if we haven't reached max attempts
     if (message.attempts >= message.maxAttempts) {
-      console.error(`[MessageQueue] Max attempts (${message.maxAttempts}) reached for message ${id}, dropping`);
+      console.log(`[MessageQueue] Max attempts (${message.maxAttempts}) reached for message ${id}, dropping`);
       this.queue.delete(id);
       return false;
     }
@@ -101,41 +165,77 @@ class MessageQueue {
       // Parse message to see what's being sent (for debugging)
       try {
         const parsedMessage = JSON.parse(message.data);
-        console.log(`[MessageQueue] Sending ${parsedMessage.type || 'unknown'} message, ID: ${id}, attempt ${message.attempts}/${message.maxAttempts}`);
-        
-        // Check if it's an answer message (for debugging)
-        if (parsedMessage.type === 'answer') {
-          console.log(`[MessageQueue] This is an ANSWER message, messageId: ${parsedMessage.messageId}, attempt ${message.attempts}/${message.maxAttempts}`);
+        // Only log non-ACK messages being sent
+        if (parsedMessage.type !== 'ack') {
+          if (message.attempts === 1) {
+            console.log(`[MessageQueue] Sending ${parsedMessage.type} message`);
+          } else {
+            console.log(`[MessageQueue] Retrying ${parsedMessage.type} message, attempt ${message.attempts}/${message.maxAttempts}`);
+          }
         }
         
         // Special case for ACK messages - don't wait for acknowledgment
         if (parsedMessage.type === 'ack') {
-          console.log(`[MessageQueue] This is an ACK message, not waiting for ACK of ACK`);
           // Remove from queue immediately since ACKs don't need acknowledgment themselves
           this.pendingMessages.delete(id);
           this.queue.delete(id);
-          // Still send the message though
         }
       } catch (err) {
-        // If parsing fails, just log the normal message
-        console.error('[MessageQueue] Failed to parse message for logging:', err);
+        // If parsing fails, just send without logging
       }
       
       // Send the message
       this.channel.send(message.data);
-      console.log(`[MessageQueue] Sent message ${id}, attempt ${message.attempts}/${message.maxAttempts}`);
       
-      // Set a timeout to consider message as failed if no ACK received
+      // Different timeout durations for different message types
+      let timeoutDuration = 3000; // Default 3 seconds
+      try {
+        const parsedData = JSON.parse(message.data);
+        if (parsedData.type === 'answer') {
+          timeoutDuration = 1000; // Shorter timeout for answers (1 second)
+        } else if (parsedData.type === 'ack') {
+          timeoutDuration = 500; // Very short timeout for ACKs (0.5 seconds)
+        }
+      } catch (err) {
+        // Use default timeout if parsing fails
+      }
+      
+      // Set timeout to consider message as failed if no ACK received
       setTimeout(() => {
         if (this.pendingMessages.has(id) && !this.acknowledgedMessages.has(id)) {
-          console.log(`[MessageQueue] No ACK for message ${id} after waiting, will retry on next timer`);
+          // Only log timeout for non-ACK messages
+          try {
+            const parsedData = JSON.parse(message.data);
+            if (parsedData.type !== 'ack') {
+              console.log(`[MessageQueue] Message ${parsedData.type} timed out, will retry`);
+            }
+          } catch (err) {
+            // If we can't parse, assume it's not an ACK and log
+            console.log(`[MessageQueue] Message timed out, will retry`);
+          }
+          
           this.pendingMessages.delete(id);
+          
+          try {
+            const parsedData = JSON.parse(message.data);
+            if (parsedData.type === 'answer') {
+              const answerData = JSON.parse(parsedData.payload);
+              const quizId = answerData.quizId;
+              
+              // Mark quiz as completed even if we don't get ACK
+              this.completedQuizzes.add(quizId);
+              console.log(`[MessageQueue] Marking quiz ${quizId} as completed after timeout`);
+              this.queue.delete(id);
+            }
+          } catch (err) {
+            // Not JSON or couldn't parse, continue with normal processing
+          }
         }
-      }, 3000); // Wait 3 seconds for ACK
+      }, timeoutDuration);
       
       return true;
     } catch (err) {
-      console.error(`[MessageQueue] Error sending message ${id}:`, err);
+      console.error(`[MessageQueue] Error sending message:`, err);
       this.pendingMessages.delete(id);
       return false;
     }
@@ -143,33 +243,54 @@ class MessageQueue {
   
   // Mark a message as successfully delivered (called when ACK received)
   acknowledge(id: string): void {
-    console.log(`[MessageQueue] Acknowledging message ${id}`);
-    
     // Check if this is a messageId (from the message) rather than a queue ID
     const queueId = this.messageIdToQueueId.get(id) || id;
     
-    if (queueId !== id) {
-      console.log(`[MessageQueue] Mapped messageId ${id} to queue ID ${queueId}`);
+    // Get the message data to check if it's an answer
+    const message = this.queue.get(queueId);
+    if (message) {
+      try {
+        const parsedData = JSON.parse(message.data);
+        if (parsedData.type === 'answer') {
+          const answerData = JSON.parse(parsedData.payload);
+          const quizId = answerData.quizId;
+          console.log(`[MessageQueue] Acknowledged answer for quiz ${quizId}`);
+          
+          // Mark the quiz as completed when we get acknowledgment
+          this.completedQuizzes.add(quizId);
+          
+          // Remove all pending messages for this quiz
+          for (const [msgId, msg] of this.queue.entries()) {
+            try {
+              const data = JSON.parse(msg.data);
+              if (data.type === 'answer') {
+                const payload = JSON.parse(data.payload);
+                if (payload.quizId === quizId) {
+                  console.log(`[MessageQueue] Removing redundant message for completed quiz ${quizId}`);
+                  this.queue.delete(msgId);
+                  this.pendingMessages.delete(msgId);
+                }
+              }
+            } catch (err) {
+              // Skip if we can't parse the message
+            }
+          }
+        }
+      } catch (err) {
+        // Not JSON or couldn't parse, continue with normal processing
+      }
     }
     
-    // If it's not in our queue, still add to the acknowledged set
-    if (!this.queue.has(queueId) && !this.pendingMessages.has(queueId)) {
-      console.log(`[MessageQueue] Message ${queueId} is not in our queue, might be already acknowledged`);
-      this.acknowledgedMessages.add(id); // Add the original messageId to the acknowledged set
-      this.acknowledgedMessages.add(queueId); // Also add the queue ID to be safe
-      return;
-    }
-    
+    // Remove from pending and queue
     this.pendingMessages.delete(queueId);
     this.queue.delete(queueId);
     
-    // Add both the original messageId and the queue ID to the acknowledged set
+    // Add both IDs to acknowledged set
     this.acknowledgedMessages.add(id);
     this.acknowledgedMessages.add(queueId);
     
-    // Keep the acknowledged set from growing too large
+    // Clean up old acknowledgments if we have too many
     if (this.acknowledgedMessages.size > 100) {
-      // Remove oldest entries if we have too many
       const toRemove = Array.from(this.acknowledgedMessages).slice(0, 50);
       toRemove.forEach(msgId => this.acknowledgedMessages.delete(msgId));
     }
@@ -182,8 +303,30 @@ class MessageQueue {
     this.retryInterval = setInterval(() => {
       // Only process if we have items and channel is open
       if (this.queue.size > 0 && this.channel.readyState === 'open') {
-        console.log(`[MessageQueue] Retry timer: ${this.queue.size} messages in queue`);
+        // Count non-ACK messages in queue
+        let nonAckCount = 0;
+        let hasAnswerMessages = false;
         
+        for (const [_, message] of this.queue.entries()) {
+          try {
+            const parsedData = JSON.parse(message.data);
+            if (parsedData.type !== 'ack') {
+              nonAckCount++;
+              if (parsedData.type === 'answer') {
+                hasAnswerMessages = true;
+              }
+            }
+          } catch (err) {
+            nonAckCount++; // If we can't parse, count it
+          }
+        }
+        
+        // Only log if there are answer messages in the queue
+        if (hasAnswerMessages) {
+          console.log(`[MessageQueue] Retry timer: processing ${nonAckCount} messages, including answers`);
+        }
+        
+        // Process messages
         for (const [id, message] of this.queue.entries()) {
           // Skip messages that are pending ACK
           if (this.pendingMessages.has(id)) continue;
@@ -196,7 +339,15 @@ class MessageQueue {
           
           // If we've reached max attempts, remove from queue
           if (message.attempts >= message.maxAttempts) {
-            console.error(`[MessageQueue] Max attempts reached for message ${id}, dropping`);
+            try {
+              const parsedData = JSON.parse(message.data);
+              if (parsedData.type !== 'ack') {
+                console.log(`[MessageQueue] Max attempts reached for ${parsedData.type} message, dropping`);
+              }
+            } catch (err) {
+              // If we can't parse, just log generic message
+              console.log(`[MessageQueue] Max attempts reached for message, dropping`);
+            }
             this.queue.delete(id);
             continue;
           }
@@ -217,26 +368,46 @@ class MessageQueue {
   }
 }
 
-export async function createConnection() {
-    const creatorPeer = new RTCPeerConnection({
-      iceServers: [
-        { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302"] },
-        // Use Google's free TURN server
-        {
-          urls: "turn:us-turn1.3cx.com:443?transport=tcp",
-          username: "test",
-          credential: "test"
-        },
-        {
-          urls: "turn:us-turn2.3cx.com:80?transport=tcp",
-          username: "test",
-          credential: "test"
-        }
+// Update the ICE server configuration for both creator and participant
+const getICEConfiguration = (): RTCConfiguration => ({
+  iceServers: [
+    // STUN servers
+    { 
+      urls: [
+        "stun:stun.l.google.com:19302",
+        "stun:stun1.l.google.com:19302",
+        "stun:stun2.l.google.com:19302",
+        "stun:stun3.l.google.com:19302",
+        "stun:stun4.l.google.com:19302"
+      ]
+    },
+    // Primary TURN servers
+    {
+      urls: [
+        "turn:us-turn1.3cx.com:443?transport=tcp",
+        "turn:us-turn2.3cx.com:80?transport=tcp"
       ],
-      iceTransportPolicy: 'all',
-      iceCandidatePoolSize: 10
-    });
-  
+      username: "test",
+      credential: "test"
+    },
+    // Backup TURN servers
+    {
+      urls: [
+        "turn:us-turn4.3cx.com:443?transport=tcp",
+        "turn:us-turn3.3cx.com:80?transport=tcp"
+      ],
+      username: "test",
+      credential: "test"
+    }
+  ],
+  iceTransportPolicy: 'all',
+  iceCandidatePoolSize: 10,
+  bundlePolicy: 'max-bundle' as RTCBundlePolicy,
+  rtcpMuxPolicy: 'require' as RTCRtcpMuxPolicy
+});
+
+export async function createConnection() {
+    const creatorPeer = new RTCPeerConnection(getICEConfiguration());
     console.log("[Creator] Creating RTCPeerConnection");
   
     // Create data channel with more reliable settings
@@ -295,55 +466,10 @@ export async function createConnection() {
       }
     };
   
-    dataChannel.onmessage = (event) => {
-      console.log("[Creator] Received message:", event.data);
-      
-      try {
-        // Check if it's an ACK message
-        const data = JSON.parse(event.data);
-        
-        // NEW: Log the complete message type for debugging
-        console.log(`[Creator] Parsed message type: ${data.type}, messageId: ${data.messageId || 'none'}`);
-        
-        if (data.type === 'ack' && data.messageId) {
-          // Find message queue and acknowledge
-          const messageQueue = messageQueues.get(sessionId);
-          if (messageQueue) {
-            console.log(`[Creator] Received ACK for message ${data.messageId}`);
-            messageQueue.acknowledge(data.messageId);
-          } else {
-            console.error(`[Creator] No message queue found for session ${sessionId}`);
-          }
-          return; // Don't process ACKs further
-        }
-        
-        // Try to send ACK immediately for any message with an ID
-        if (data.messageId) {
-          try {
-            console.log(`[Creator] Sending immediate ACK for message ${data.messageId}`);
-            
-            // FIXED: Send ACK directly without using the message queue at all
-            if (dataChannel.readyState === 'open') {
-              const ack = JSON.stringify({
-                type: 'ack',
-                messageId: data.messageId,
-                timestamp: Date.now()
-              });
-              
-              // Send directly - no enqueuing
-              dataChannel.send(ack);
-              console.log(`[Creator] Sent direct ACK for message ${data.messageId}`);
-            }
-          } catch (ackErr) {
-            console.error('[Creator] Failed to send ACK:', ackErr);
-          }
-        }
-      } catch (err) {
-        console.error('[Creator] Error processing message:', err);
-        // Not JSON or not in ACK format, continue with normal processing
-      }
-    };
-  
+    // Create persistent sets to track processed message IDs
+    const processedMessageIds = new Set<string>();
+    const messageQueues = new Map<string, MessageQueue>();
+
     // Create offer first
     console.log("[Creator] Creating offer");
     const offerOptions: RTCOfferOptions = {
@@ -375,6 +501,44 @@ export async function createConnection() {
     const { sessionId } = await response.json();
     console.log("[Creator] Session created with ID:", sessionId);
 
+    // Initialize message queue after we have the sessionId
+    const messageQueue = new MessageQueue(dataChannel);
+    messageQueues.set(sessionId, messageQueue);
+
+    dataChannel.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        
+        // Handle ACK messages silently
+        if (data.type === 'ack' && data.messageId) {
+          const messageQueue = messageQueues.get(sessionId);
+          if (messageQueue) {
+            messageQueue.acknowledge(data.messageId);
+          }
+          return; // Don't process ACKs further
+        }
+        
+        // For non-ACK messages that have a messageId, send ACK only if not processed before
+        if (data.messageId && !processedMessageIds.has(data.messageId)) {
+          processedMessageIds.add(data.messageId);
+          
+          // Only send ACK for messages that require reliability
+          if (data.type === 'quiz' || data.type === 'answer') {
+            if (dataChannel.readyState === 'open') {
+              const ack = JSON.stringify({
+                type: 'ack',
+                messageId: data.messageId,
+                timestamp: Date.now()
+              });
+              dataChannel.send(ack);
+            }
+          }
+        }
+      } catch (err) {
+        console.error('[Creator] Error processing message:', err);
+      }
+    };
+  
     // Set up ICE candidate handling after we have the sessionId
     creatorPeer.onicecandidate = async (event) => {
       if (event.candidate) {
@@ -400,124 +564,109 @@ export async function createConnection() {
       }
     };
   
-    // Set up connection state handlers
-    creatorPeer.onconnectionstatechange = () => {
-      console.log("[Creator] Connection state:", creatorPeer.connectionState);
-      if (creatorPeer.connectionState === 'failed') {
-        console.error("[Creator] Connection failed, attempting ICE restart");
-        // Try ICE restart
-        creatorPeer.restartIce();
-        
-        // If ICE restart doesn't work after 5 seconds, try full reconnection
-        setTimeout(async () => {
-          if (creatorPeer.connectionState === 'failed') {
-            console.log("[Creator] ICE restart failed, attempting full reconnection");
-            try {
-              const offer = await creatorPeer.createOffer({ iceRestart: true });
-              await creatorPeer.setLocalDescription(offer);
-              
-              // Send the new offer to signaling server
-              const response = await fetch('/api/signal', {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ 
-                  sessionId,
-                  offer: creatorPeer.localDescription,
-                  role: 'creator'
-                })
-              });
-              
-              if (!response.ok) {
-                throw new Error('Failed to send new offer to signaling server');
-              }
-            } catch (err) {
-              console.error("[Creator] Failed to perform full reconnection:", err);
-            }
-          }
-        }, 5000);
-      } else if (creatorPeer.connectionState === 'disconnected') {
-        console.log("[Creator] Connection disconnected, waiting for reconnection");
-        // Add a timeout to detect if disconnection persists
-        setTimeout(() => {
-          if (creatorPeer.connectionState === 'disconnected') {
-            console.log("[Creator] Connection still disconnected, attempting ICE restart");
-            creatorPeer.restartIce();
-          }
-        }, 3000);
-      }
-    };
-  
-    creatorPeer.oniceconnectionstatechange = () => {
-      console.log("[Creator] ICE Connection state:", creatorPeer.iceConnectionState);
-      // Handle specific ICE connection states
-      if (creatorPeer.iceConnectionState === 'failed') {
-        console.log("[Creator] ICE Connection failed, gathering new candidates");
-        creatorPeer.restartIce();
-      } else if (creatorPeer.iceConnectionState === 'disconnected') {
-        // Start a timer to check if we need to restart ICE
-        setTimeout(() => {
-          if (creatorPeer.iceConnectionState === 'disconnected') {
-            console.log("[Creator] ICE still disconnected, restarting");
-            creatorPeer.restartIce();
-          }
-        }, 3000);
-      }
-    };
+    // Enhanced connection state monitoring
+    let connectionMonitorInterval: NodeJS.Timeout | null = null;
+    let lastStateChange = Date.now();
+    const MAX_STATE_DURATION = 10000; // 10 seconds
 
-    creatorPeer.onnegotiationneeded = async () => {
-      console.log("[Creator] Negotiation needed");
-      try {
-        const offer = await creatorPeer.createOffer();
-        await creatorPeer.setLocalDescription(offer);
-        
-        // Send the new offer to signaling server
-        const response = await fetch('/api/signal', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ 
-            sessionId,
-            offer: creatorPeer.localDescription,
-            role: 'creator'
-          })
-        });
-        
-        if (!response.ok) {
-          throw new Error('Failed to send negotiation offer to signaling server');
+    const monitorConnection = () => {
+      if (connectionMonitorInterval) clearInterval(connectionMonitorInterval);
+      
+      connectionMonitorInterval = setInterval(() => {
+        const currentTime = Date.now();
+        const stateDuration = currentTime - lastStateChange;
+
+        if (creatorPeer.connectionState === 'disconnected' && stateDuration > MAX_STATE_DURATION) {
+          console.log("[Creator] Connection stuck in disconnected state, attempting recovery");
+          handleConnectionRecovery();
         }
-      } catch (err) {
-        console.error("[Creator] Failed to handle negotiation:", err);
+      }, 2000);
+    };
+
+    const handleConnectionRecovery = async () => {
+      console.log("[Creator] Starting connection recovery process");
+      
+      if (creatorPeer.connectionState === 'failed' || creatorPeer.connectionState === 'disconnected') {
+        try {
+          // First try ICE restart
+          const offer = await creatorPeer.createOffer({ iceRestart: true });
+          await creatorPeer.setLocalDescription(offer);
+          
+          // Send the new offer to signaling server
+          const response = await fetch('/api/signal', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+              sessionId,
+              offer: creatorPeer.localDescription,
+              role: 'creator',
+              recovery: true
+            })
+          });
+          
+          if (!response.ok) {
+            throw new Error('Failed to send recovery offer');
+          }
+          
+          console.log("[Creator] Recovery offer sent successfully");
+          lastStateChange = Date.now(); // Reset the timer
+        } catch (err) {
+          console.error("[Creator] Recovery attempt failed:", err);
+        }
       }
     };
 
-    // Create a message queue for this channel
-    const messageQueues = new Map<string, MessageQueue>();
-    const messageQueue = new MessageQueue(dataChannel);
-    messageQueues.set(sessionId, messageQueue);
+    // Update connection state handler
+    creatorPeer.onconnectionstatechange = () => {
+      const state = creatorPeer.connectionState;
+      console.log("[Creator] Connection state:", state);
+      lastStateChange = Date.now();
+
+      if (state === 'connected') {
+        console.log("[Creator] Connection established successfully");
+      } else if (state === 'disconnected') {
+        console.log("[Creator] Connection disconnected, monitoring for recovery");
+        monitorConnection();
+      } else if (state === 'failed') {
+        console.log("[Creator] Connection failed, attempting immediate recovery");
+        handleConnectionRecovery();
+      }
+    };
 
     // Return object with additional methods for reliable messaging
     return { 
       creatorPeer, 
       dataChannel, 
       sessionId,
-      // Add a method to send messages reliably
       sendReliableMessage: (data: any) => {
-        // IMPROVED: More detailed logging
         const type = data.type || 'unknown';
-        console.log(`[Creator] Preparing to send reliable message of type: ${type}`);
+        console.log(`[Creator] Preparing to send message of type: ${type}`);
         
-        // FIXED: Ensure a consistent messageId is used
+        // Only use reliable messaging for answers and quizzes
+        const needsReliability = type === 'answer' || type === 'quiz';
+        
+        if (!needsReliability) {
+          // Send directly without queuing or message ID for heartbeats, acks, etc.
+          if (dataChannel.readyState === 'open') {
+            const messageString = JSON.stringify(data);
+            dataChannel.send(messageString);
+            return null;
+          }
+          return null;
+        }
+        
+        // For messages needing reliability (answers and quizzes)
         let messageId = data.messageId;
         if (!messageId) {
           messageId = Math.random().toString(36).substring(2);
         }
         
-        // Create a new message with the messageId
         const message = {
           ...data,
           messageId
         };
         
-        console.log(`[Creator] Sending message with ID: ${messageId}, type: ${type}`);
+        console.log(`[Creator] Sending reliable message with ID: ${messageId}, type: ${type}`);
         const messageString = JSON.stringify(message);
         return messageQueue.enqueue(messageString);
       }
@@ -539,456 +688,344 @@ export function addParticipantIceCandidate(
 }
   
 export async function joinConnection(sessionId: string, participantId: string) {
-  console.log("[Participant] Joining session:", sessionId);
-  
-  // Get the host address dynamically
-  const hostAddress = await getHostAddress();
-  
-  // Get session info from signaling server
-  const response = await fetch(`http://${hostAddress}/api/signal?session=${sessionId}&participant=${participantId}`);
-  if (!response.ok) {
-    throw new Error('Failed to get session info');
-  }
+    // Create persistent set to track processed message IDs at the connection level
+    const processedMessageIds = new Set<string>();
+    
+    console.log("[Participant] Joining session:", sessionId);
+    
+    const participantPeer = new RTCPeerConnection(getICEConfiguration());
+    
+    // Enhanced connection monitoring for participant
+    let connectionMonitorInterval: NodeJS.Timeout | null = null;
+    let lastStateChange = Date.now();
+    const MAX_STATE_DURATION = 10000; // 10 seconds
 
-  const session = await response.json();
-  
-  if (!session.offer) {
-    throw new Error('No offer found for this session');
-  }
+    // Get the host address dynamically
+    const hostAddress = await getHostAddress();
+    
+    // Get session info from signaling server
+    const response = await fetch(`http://${hostAddress}/api/signal?session=${sessionId}&participant=${participantId}`);
+    if (!response.ok) {
+      throw new Error('Failed to get session info');
+    }
 
-  console.log("[Participant] Got session info with offer");
+    const session = await response.json();
+    
+    if (!session.offer) {
+      throw new Error('No offer found for this session');
+    }
 
-  // Create new RTCPeerConnection with fresh ICE servers
-  const participantPeer = new RTCPeerConnection({
-    iceServers: [
-      { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302"] },
-      // Use Google's free TURN server
-      {
-        urls: "turn:us-turn1.3cx.com:443?transport=tcp",
-        username: "test",
-        credential: "test"
-      },
-      {
-        urls: "turn:us-turn2.3cx.com:80?transport=tcp",
-        username: "test",
-        credential: "test"
-      }
-    ],
-    iceTransportPolicy: 'all',
-    iceCandidatePoolSize: 10
-  });
+    console.log("[Participant] Got session info with offer");
 
-  let receiveChannel: RTCDataChannel | null = null;
-  
-  // Add a messageQueue for participant
-  let messageQueue: MessageQueue | null = null;
+    let receiveChannel: RTCDataChannel | null = null;
+    let messageQueue: MessageQueue | null = null;
 
-  // Create a more robust promise for data channel establishment
-  const channelPromise = new Promise<RTCDataChannel>((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      reject(new Error('Data channel establishment timeout'));
-    }, 30000); // Increased timeout to 30 seconds
+    // Create a more robust promise for data channel establishment
+    const channelPromise = new Promise<RTCDataChannel>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Data channel establishment timeout'));
+      }, 30000);
 
-    try {
-      // First set the remote description before creating data channel
-      console.log("[Participant] Setting remote description");
-      participantPeer.setRemoteDescription(session.offer)
-        .then(() => {
-          console.log("[Participant] Remote description set successfully");
-          
-          // After setting remote description, create the data channel
-          try {
-            // Create the data channel with the same ID as the creator
-            const channel = participantPeer.createDataChannel("quizChannel", {
-              ordered: true,
-              maxRetransmits: 10,
-              protocol: 'quiz',
-              negotiated: true,
-              id: 0
-            });
-
-            console.log("[Participant] Created data channel with ID:", channel.id);
+      try {
+        // First set the remote description before creating data channel
+        console.log("[Participant] Setting remote description");
+        participantPeer.setRemoteDescription(session.offer)
+          .then(() => {
+            console.log("[Participant] Remote description set successfully");
             
-            channel.onopen = () => {
-              console.log("[Participant] Data Channel is open!");
-              
-              // Initialize message queue when channel opens
-              if (!messageQueue) {
-                messageQueue = new MessageQueue(channel);
-              }
-              
-              clearTimeout(timeout);
-              resolve(channel);
-            };
+            // After setting remote description, create the data channel
+            try {
+              // Create the data channel with the same ID as the creator
+              const channel = participantPeer.createDataChannel("quizChannel", {
+                ordered: true,
+                maxRetransmits: 10,
+                protocol: 'quiz',
+                negotiated: true,
+                id: 0
+              });
 
-            channel.onclose = () => {
-              console.log("[Participant] Data Channel closed!");
-            };
-
-            channel.onerror = (event) => {
-              console.error("[Participant] Data Channel error:", event);
-              // Don't reject here as we might still get a channel via ondatachannel
-            };
-            
-            channel.onmessage = (event) => {
-              console.log("[Participant] Received message:", event.data);
+              console.log("[Participant] Created data channel with ID:", channel.id);
               
-              try {
-                // Check if it's an ACK message
-                const data = JSON.parse(event.data);
+              channel.onopen = () => {
+                console.log("[Participant] Data Channel is open!");
                 
-                // NEW: Log the complete message type for debugging
-                console.log(`[Participant] Parsed message type: ${data.type}, messageId: ${data.messageId || 'none'}`);
+                // Initialize message queue when channel opens
+                if (!messageQueue) {
+                  messageQueue = new MessageQueue(channel);
+                }
                 
-                if (data.type === 'ack' && data.messageId) {
-                  // FIXED: More robust acknowledgment handling
-                  console.log(`[Participant] Received ACK for message ${data.messageId}`);
+                clearTimeout(timeout);
+                resolve(channel);
+              };
+
+              channel.onclose = () => {
+                console.log("[Participant] Data Channel closed!");
+              };
+
+              channel.onerror = (event) => {
+                console.error("[Participant] Data Channel error:", event);
+              };
+              
+              channel.onmessage = (event) => {
+                try {
+                  const data = JSON.parse(event.data);
                   
-                  // Acknowledge the message
-                  if (messageQueue) {
-                    messageQueue.acknowledge(data.messageId);
-                    console.log(`[Participant] Successfully acknowledged message ${data.messageId}`);
-                  } else {
-                    console.error('[Participant] No message queue available for acknowledgment');
+                  // Handle ACK messages silently
+                  if (data.type === 'ack' && data.messageId) {
+                    if (messageQueue) {
+                      messageQueue.acknowledge(data.messageId);
+                    }
+                    return; // Don't process ACKs further
                   }
-                  return; // Don't process ACKs further
+                  
+                  // For non-ACK messages that have a messageId, send ACK only if not processed before
+                  if (data.messageId && !processedMessageIds.has(data.messageId)) {
+                    processedMessageIds.add(data.messageId);
+                    
+                    // Only send ACK for messages that require reliability
+                    if (data.type === 'quiz' || data.type === 'answer') {
+                      if (channel.readyState === 'open') {
+                        const ack = JSON.stringify({
+                          type: 'ack',
+                          messageId: data.messageId,
+                          timestamp: Date.now()
+                        });
+                        channel.send(ack);
+                      }
+                    }
+                  }
+                } catch (err) {
+                  console.error('[Participant] Error processing message:', err);
+                }
+              };
+
+              // Save reference to the channel
+              receiveChannel = channel;
+
+              // If the channel is already open (rare but possible), resolve immediately
+              if (channel.readyState === 'open') {
+                console.log("[Participant] Data Channel already open!");
+                
+                // Initialize message queue
+                if (!messageQueue) {
+                  messageQueue = new MessageQueue(channel);
                 }
                 
-                // Try to send ACK immediately for any message with an ID
-                if (data.messageId) {
-                  try {
-                    console.log(`[Participant] Sending immediate ACK for message ${data.messageId}`);
-                    
-                    // FIXED: Send ACK directly without using the message queue at all
-                    if (channel.readyState === 'open') {
-                      const ack = JSON.stringify({
-                        type: 'ack',
-                        messageId: data.messageId,
-                        timestamp: Date.now()
-                      });
-                      
-                      // Send directly - no enqueuing
-                      channel.send(ack);
-                      console.log(`[Participant] Sent direct ACK for message ${data.messageId}`);
-                    }
-                  } catch (ackErr) {
-                    console.error('[Participant] Failed to send ACK:', ackErr);
-                  }
+                clearTimeout(timeout);
+                resolve(channel);
+              }
+            } catch (err) {
+              console.error("[Participant] Failed to create data channel:", err);
+              // Continue - we'll try with ondatachannel as backup
+            }
+            
+            // Create and set local description (answer)
+            console.log("[Participant] Creating answer");
+            return participantPeer.createAnswer();
+          })
+          .then(answer => {
+            return participantPeer.setLocalDescription(answer);
+          })
+          .then(() => {
+            console.log("[Participant] Local description (answer) set");
+            
+            // Add existing ICE candidates after setting descriptions
+            if (session.creatorIce?.length) {
+              console.log("[Participant] Adding existing ICE candidates:", session.creatorIce.length);
+              return Promise.all(session.creatorIce.map((ice: RTCIceCandidateInit) => {
+                return participantPeer.addIceCandidate(new RTCIceCandidate(ice))
+                  .catch(err => console.error('[Participant] Failed to add ICE candidate:', err));
+              }));
+            }
+          })
+          .then(() => {
+            // Send answer to signaling server
+            console.log("[Participant] Sending answer to signaling server");
+            return fetch(`http://${hostAddress}/api/signal`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ 
+                sessionId,
+                participantId,
+                answer: participantPeer.localDescription 
+              })
+            });
+          })
+          .then(response => {
+            if (!response.ok) {
+              throw new Error('Failed to send answer to signaling server');
+            }
+            console.log("[Participant] Answer sent successfully");
+          })
+          .catch(err => {
+            console.error("[Participant] Error in connection setup:", err);
+            reject(err);
+          });
+      } catch (err) {
+        console.error("[Participant] Error in connection initialization:", err);
+        clearTimeout(timeout);
+        reject(err);
+      }
+
+      // Also listen for ondatachannel event as fallback
+      participantPeer.ondatachannel = (event) => {
+        console.log("[Participant] Received data channel from ondatachannel event");
+        const backupChannel = event.channel;
+
+        backupChannel.onopen = () => {
+          console.log("[Participant] Backup Data Channel is open!");
+          
+          // Initialize message queue for backup channel
+          if (!messageQueue && (receiveChannel === null || receiveChannel.readyState !== 'open')) {
+            messageQueue = new MessageQueue(backupChannel);
+          }
+          
+          if (!receiveChannel || receiveChannel.readyState !== 'open') {
+            clearTimeout(timeout);
+            resolve(backupChannel);
+          }
+        };
+
+        backupChannel.onclose = () => {
+          console.log("[Participant] Backup Data Channel closed!");
+        };
+
+        backupChannel.onerror = (event) => {
+          console.error("[Participant] Backup Data Channel error:", event);
+        };
+
+        backupChannel.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            
+            // Handle ACK messages silently
+            if (data.type === 'ack' && data.messageId) {
+              if (messageQueue) {
+                messageQueue.acknowledge(data.messageId);
+              }
+              return; // Don't process ACKs further
+            }
+            
+            // For non-ACK messages that have a messageId, send ACK only if not processed before
+            if (data.messageId && !processedMessageIds.has(data.messageId)) {
+              processedMessageIds.add(data.messageId);
+              
+              // Only send ACK for messages that require reliability
+              if (data.type === 'quiz' || data.type === 'answer') {
+                if (backupChannel.readyState === 'open') {
+                  const ack = JSON.stringify({
+                    type: 'ack',
+                    messageId: data.messageId,
+                    timestamp: Date.now()
+                  });
+                  backupChannel.send(ack);
                 }
-              } catch (err) {
-                console.error('[Participant] Error processing message:', err);
-                // Not JSON or not in ACK format, continue with normal processing
               }
-            };
-
-            // Save reference to the channel
-            receiveChannel = channel;
-
-            // If the channel is already open (rare but possible), resolve immediately
-            if (channel.readyState === 'open') {
-              console.log("[Participant] Data Channel already open!");
-              
-              // Initialize message queue
-              if (!messageQueue) {
-                messageQueue = new MessageQueue(channel);
-              }
-              
-              clearTimeout(timeout);
-              resolve(channel);
             }
           } catch (err) {
-            console.error("[Participant] Failed to create data channel:", err);
-            // Continue - we'll try with ondatachannel as backup
+            console.error('[Participant] Error processing message on backup channel:', err);
           }
-          
-          // Create and set local description (answer)
-          console.log("[Participant] Creating answer");
-          return participantPeer.createAnswer();
-        })
-        .then(answer => {
-          return participantPeer.setLocalDescription(answer);
-        })
-        .then(() => {
-          console.log("[Participant] Local description (answer) set");
-          
-          // Add existing ICE candidates after setting descriptions
-          if (session.creatorIce?.length) {
-            console.log("[Participant] Adding existing ICE candidates:", session.creatorIce.length);
-            return Promise.all(session.creatorIce.map((ice: RTCIceCandidateInit) => {
-              return participantPeer.addIceCandidate(new RTCIceCandidate(ice))
-                .catch(err => console.error('[Participant] Failed to add ICE candidate:', err));
-            }));
-          }
-        })
-        .then(() => {
-          // Send answer to signaling server
-          console.log("[Participant] Sending answer to signaling server");
-          return fetch(`http://${hostAddress}/api/signal`, {
+        };
+      };
+    });
+
+    // Set up ICE candidate handling
+    participantPeer.onicecandidate = async (event) => {
+      if (event.candidate) {
+        console.log("[Participant] New ICE candidate");
+        try {
+          const response = await fetch(`http://${hostAddress}/api/signal`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
+            body: JSON.stringify({
               sessionId,
               participantId,
-              answer: participantPeer.localDescription 
+              ice: event.candidate.toJSON(),
+              role: 'participant'
             })
           });
-        })
-        .then(response => {
           if (!response.ok) {
-            throw new Error('Failed to send answer to signaling server');
-          }
-          console.log("[Participant] Answer sent successfully");
-        })
-        .catch(err => {
-          console.error("[Participant] Error in connection setup:", err);
-          reject(err);
-        });
-    } catch (err) {
-      console.error("[Participant] Error in connection initialization:", err);
-      clearTimeout(timeout);
-      reject(err);
-    }
-
-    // Also listen for ondatachannel event as fallback
-    participantPeer.ondatachannel = (event) => {
-      console.log("[Participant] Received data channel from ondatachannel event");
-      const backupChannel = event.channel;
-
-      backupChannel.onopen = () => {
-        console.log("[Participant] Backup Data Channel is open!");
-        
-        // Initialize message queue for backup channel
-        if (!messageQueue && (receiveChannel === null || receiveChannel.readyState !== 'open')) {
-          messageQueue = new MessageQueue(backupChannel);
-        }
-        
-        if (!receiveChannel || receiveChannel.readyState !== 'open') {
-          clearTimeout(timeout);
-          resolve(backupChannel);
-        }
-      };
-
-      backupChannel.onclose = () => {
-        console.log("[Participant] Backup Data Channel closed!");
-      };
-
-      backupChannel.onerror = (event) => {
-        console.error("[Participant] Backup Data Channel error:", event);
-      };
-
-      backupChannel.onmessage = (event) => {
-        console.log("[Participant] Received message on backup channel:", event.data);
-        
-        try {
-          // Check if it's an ACK message
-          const data = JSON.parse(event.data);
-          
-          // NEW: Log the complete message type for debugging
-          console.log(`[Participant] Backup channel parsed message type: ${data.type}, messageId: ${data.messageId || 'none'}`);
-          
-          if (data.type === 'ack' && data.messageId) {
-            // FIXED: More robust acknowledgment handling
-            console.log(`[Participant] Received ACK for message ${data.messageId} on backup channel`);
-            
-            // Acknowledge the message
-            if (messageQueue) {
-              messageQueue.acknowledge(data.messageId);
-              console.log(`[Participant] Successfully acknowledged message ${data.messageId} from backup channel`);
-            } else {
-              console.error('[Participant] No message queue available for acknowledgment on backup channel');
-            }
-            return; // Don't process ACKs further
-          }
-          
-          // Try to send ACK immediately for any message with an ID
-          if (data.messageId) {
-            try {
-              console.log(`[Participant] Sending immediate ACK for message ${data.messageId} from backup channel`);
-              
-              // FIXED: Send ACK directly without using the message queue at all
-              if (backupChannel.readyState === 'open') {
-                const ack = JSON.stringify({
-                  type: 'ack',
-                  messageId: data.messageId,
-                  timestamp: Date.now()
-                });
-                
-                // Send directly - no enqueuing
-                backupChannel.send(ack);
-                console.log(`[Participant] Sent direct ACK for message ${data.messageId} from backup channel`);
-              }
-            } catch (ackErr) {
-              console.error('[Participant] Failed to send ACK from backup channel:', ackErr);
-            }
+            console.error("[Participant] Failed to send ICE candidate");
           }
         } catch (err) {
-          console.error('[Participant] Error processing message on backup channel:', err);
-          // Not JSON or not in ACK format, continue with normal processing
+          console.error("[Participant] Error sending ICE candidate:", err);
+        }
+      } else {
+        console.log("[Participant] ICE gathering complete");
+      }
+    };
+
+    // Wait for data channel with a more informative timeout message
+    console.log("[Participant] Waiting for data channel to be established");
+    try {
+      const channel = await channelPromise;
+      console.log("[Participant] Data channel successfully established");
+      
+      // Ensure message queue is created
+      if (!messageQueue) {
+        messageQueue = new MessageQueue(channel);
+      }
+      
+      return {
+        participantPeer,
+        getChannel: () => channel,
+        sendReliableMessage: (data: any) => {
+          if (!messageQueue) {
+            console.error('[Participant] Cannot send message, no message queue available');
+            return null;
+          }
+          
+          let type = 'unknown';
+          try {
+            if (typeof data === 'object' && data !== null && 'type' in data) {
+              type = data.type;
+            }
+          } catch (e) {
+            // Ignore any errors in type extraction
+          }
+          
+          console.log(`[Participant] Preparing to send message of type: ${type}`);
+          
+          // Only use reliable messaging for answers and quizzes
+          const needsReliability = type === 'answer' || type === 'quiz';
+          
+          if (!needsReliability) {
+            // Send directly without queuing or message ID for heartbeats, acks, etc.
+            if (channel.readyState === 'open') {
+              const messageString = JSON.stringify(data);
+              channel.send(messageString);
+              return null;
+            }
+            return null;
+          }
+          
+          // For messages needing reliability (answers and quizzes)
+          let messageId = data.messageId;
+          if (!messageId) {
+            messageId = Math.random().toString(36).substring(2);
+          }
+          
+          // Add message ID for tracking
+          const message = {
+            ...data,
+            messageId
+          };
+          
+          console.log(`[Participant] Sending reliable message with ID: ${messageId}, type: ${type}`);
+          
+          // Log answer messages prominently
+          if (type === 'answer') {
+            console.log(`[Participant] SENDING ANSWER with ID: ${messageId} !!!`);
+          }
+          
+          const messageString = JSON.stringify(message);
+          return messageQueue.enqueue(messageString);
         }
       };
-      
-      // If the backup channel is already open, resolve immediately
-      if (backupChannel.readyState === 'open') {
-        console.log("[Participant] Backup Data Channel already open!");
-        
-        // Initialize message queue
-        if (!messageQueue && (receiveChannel === null || receiveChannel.readyState !== 'open')) {
-          messageQueue = new MessageQueue(backupChannel);
-        }
-        
-        if (!receiveChannel || receiveChannel.readyState !== 'open') {
-          clearTimeout(timeout);
-          resolve(backupChannel);
-        }
-      }
-    };
-  });
-
-  // Set up ICE candidate handling
-  participantPeer.onicecandidate = async (event) => {
-    if (event.candidate) {
-      console.log("[Participant] New ICE candidate");
-      try {
-        const response = await fetch(`http://${hostAddress}/api/signal`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            sessionId,
-            participantId,
-            ice: event.candidate.toJSON(),
-            role: 'participant'
-          })
-        });
-        if (!response.ok) {
-          console.error("[Participant] Failed to send ICE candidate");
-        }
-      } catch (err) {
-        console.error("[Participant] Error sending ICE candidate:", err);
-      }
-    } else {
-      console.log("[Participant] ICE gathering complete");
+    } catch (error) {
+      console.error("[Participant] Failed to establish data channel:", error);
+      throw error;
     }
-  };
-
-  // Set up connection state handlers with more detailed logging
-  participantPeer.onconnectionstatechange = () => {
-    console.log("[Participant] Connection state changed to:", participantPeer.connectionState);
-    if (participantPeer.connectionState === 'failed') {
-      console.error("[Participant] Connection failed, attempting ICE restart");
-      participantPeer.restartIce();
-      
-      // After 5 seconds, if still failed, try complete renegotiation
-      setTimeout(() => {
-        if (participantPeer.connectionState === 'failed' || 
-            participantPeer.connectionState === 'disconnected') {
-          console.log("[Participant] Connection still broken after ICE restart, suggesting reconnect");
-        }
-      }, 5000);
-    }
-  };
-
-  participantPeer.oniceconnectionstatechange = () => {
-    console.log("[Participant] ICE Connection state changed to:", participantPeer.iceConnectionState);
-    if (participantPeer.iceConnectionState === 'failed') {
-      console.log("[Participant] ICE Connection failed, attempting restart");
-      participantPeer.restartIce();
-    } else if (participantPeer.iceConnectionState === 'disconnected') {
-      // Start a timer to check if we need to restart ICE
-      setTimeout(() => {
-        if (participantPeer.iceConnectionState === 'disconnected') {
-          console.log("[Participant] ICE still disconnected, restarting");
-          participantPeer.restartIce();
-        }
-      }, 3000);
-    }
-  };
-
-  participantPeer.onnegotiationneeded = async () => {
-    console.log("[Participant] Negotiation needed");
-    try {
-      // Create a new answer
-      const answer = await participantPeer.createAnswer();
-      await participantPeer.setLocalDescription(answer);
-      
-      // Send the new answer to the server
-      const response = await fetch(`http://${hostAddress}/api/signal`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId,
-          participantId,
-          answer: participantPeer.localDescription
-        })
-      });
-      
-      if (!response.ok) {
-        throw new Error('Failed to send renegotiation answer');
-      }
-    } catch (err) {
-      console.error("[Participant] Failed to handle negotiation:", err);
-    }
-  };
-
-  // Wait for data channel with a more informative timeout message
-  console.log("[Participant] Waiting for data channel to be established");
-  try {
-    const channel = await channelPromise;
-    console.log("[Participant] Data channel successfully established");
-    
-    // Ensure message queue is created
-    if (!messageQueue) {
-      messageQueue = new MessageQueue(channel);
-    }
-    
-    return {
-      participantPeer,
-      getChannel: () => channel,
-      // Add method to send messages reliably
-      sendReliableMessage: (data: any) => {
-        if (!messageQueue) {
-          console.error('[Participant] Cannot send message, no message queue available');
-          return null;
-        }
-        
-        let type = 'unknown';
-        try {
-          // Try to extract the message type for better logging
-          if (typeof data === 'object' && data !== null && 'type' in data) {
-            type = data.type;
-          }
-        } catch (e) {
-          // Ignore any errors in type extraction
-        }
-        
-        console.log(`[Participant] Preparing to send reliable message of type: ${type}`);
-        
-        // FIXED: Ensure a consistent messageId is used
-        let messageId = data.messageId;
-        if (!messageId) {
-          messageId = Math.random().toString(36).substring(2);
-        }
-        
-        // Add message ID for tracking
-        const message = {
-          ...data,
-          messageId
-        };
-        
-        console.log(`[Participant] Sending message with ID: ${messageId}, type: ${type}`);
-        
-        // IMPORTANT: If this is an answer message, log it prominently
-        if (type === 'answer') {
-          console.log(`[Participant] SENDING ANSWER with ID: ${messageId} !!!`);
-        }
-        
-        const messageString = JSON.stringify(message);
-        return messageQueue.enqueue(messageString);
-      }
-    };
-  } catch (error) {
-    console.error("[Participant] Failed to establish data channel:", error);
-    throw error;
-  }
 }
   
 export function addCreatorIceCandidate(

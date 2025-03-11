@@ -88,6 +88,9 @@ export default function HomePage() {
   // Add a new state for host address
   const [hostAddress, setHostAddress] = useState<string>('');
   
+  // Add new state for tracking processed message IDs
+  const processedMessageIdsRef = useRef<Set<string>>(new Set());
+  
   // Fetch the host address when the component mounts
   useEffect(() => {
     async function fetchHostAddress() {
@@ -191,23 +194,26 @@ export default function HomePage() {
         try {
           const parsed = JSON.parse(event.data);
           
-          // Immediately send ACK for any message with messageId to prevent retry loops
-          if (parsed.messageId) {
-            try {
+          // Handle ACK messages silently
+          if (parsed.type === 'ack' && parsed.messageId) {
+            return; // Don't process ACKs further
+          }
+          
+          // Only send ACK for non-ACK messages with messageId that we haven't processed
+          if (parsed.messageId && !processedMessageIdsRef.current.has(parsed.messageId)) {
+            processedMessageIdsRef.current.add(parsed.messageId);
+            
+            // Only send ACK for messages that require reliability
+            if (parsed.type === 'quiz' || parsed.type === 'answer') {
               const ack = JSON.stringify({
                 type: 'ack',
-                messageId: parsed.messageId
+                messageId: parsed.messageId,
+                timestamp: Date.now()
               });
               
-              // Send ACK with a small delay to prevent collision
-              setTimeout(() => {
-                if (dataChannel.readyState === 'open') {
-                  dataChannel.send(ack);
-                  console.log(`[Creator] Sent ACK for message ${parsed.messageId}`);
-                }
-              }, 50);
-            } catch (ackErr) {
-              console.error('[Creator] Failed to send ACK:', ackErr);
+              if (dataChannel.readyState === 'open') {
+                dataChannel.send(ack);
+              }
             }
           }
           
@@ -546,26 +552,28 @@ export default function HomePage() {
 
     channel.onmessage = (event) => {
       try {
-        console.log("[Participant Frontend] Received message:", event.data);
         const parsed = JSON.parse(event.data);
         
-        // Immediately send ACK for any message with messageId to prevent retry loops
-        if (parsed.messageId) {
-          try {
+        // Handle ACK messages silently
+        if (parsed.type === 'ack' && parsed.messageId) {
+          return; // Don't process ACKs further
+        }
+        
+        // Only send ACK for non-ACK messages with messageId that we haven't processed
+        if (parsed.messageId && !processedMessageIdsRef.current.has(parsed.messageId)) {
+          processedMessageIdsRef.current.add(parsed.messageId);
+          
+          // Only send ACK for messages that require reliability
+          if (parsed.type === 'quiz' || parsed.type === 'answer') {
             const ack = JSON.stringify({
               type: 'ack',
-              messageId: parsed.messageId
+              messageId: parsed.messageId,
+              timestamp: Date.now()
             });
             
-            // Send ACK with a small delay to prevent collision
-            setTimeout(() => {
-              if (channel.readyState === 'open') {
-                channel.send(ack);
-                console.log(`[Participant] Sent ACK for message ${parsed.messageId}`);
-              }
-            }, 50);
-          } catch (ackErr) {
-            console.error('[Participant] Failed to send ACK:', ackErr);
+            if (channel.readyState === 'open') {
+              channel.send(ack);
+            }
           }
         }
         
