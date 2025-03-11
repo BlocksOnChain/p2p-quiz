@@ -704,7 +704,7 @@ export async function joinConnection(sessionId: string, participantId: string) {
     const hostAddress = await getHostAddress();
     
     // Get session info from signaling server
-    const response = await fetch(`http://${hostAddress}/api/signal?session=${sessionId}&participant=${participantId}`);
+    const response = await fetch(`/api/signal?session=${sessionId}&participant=${participantId}`);
     if (!response.ok) {
       throw new Error('Failed to get session info');
     }
@@ -841,7 +841,7 @@ export async function joinConnection(sessionId: string, participantId: string) {
           .then(() => {
             // Send answer to signaling server
             console.log("[Participant] Sending answer to signaling server");
-            return fetch(`https://${hostAddress}/api/signal`, {
+            return fetch(`/api/signal`, {
               method: 'PUT',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ 
@@ -934,7 +934,7 @@ export async function joinConnection(sessionId: string, participantId: string) {
       if (event.candidate) {
         console.log("[Participant] New ICE candidate");
         try {
-          const response = await fetch(`https://${hostAddress}/api/signal`, {
+          const response = await fetch(`/api/signal`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
