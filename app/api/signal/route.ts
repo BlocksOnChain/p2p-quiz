@@ -27,7 +27,7 @@ function cleanupOldSessions() {
     // Check if this session is too old
     let allParticipantsInactive = true;
     
-    for (const [, participant] of session.participants.entries()) {
+    for (const [participantId, participant] of session.participants.entries()) {
       if (now - participant.lastSeen < MAX_AGE) {
         allParticipantsInactive = false;
         break;
@@ -84,11 +84,7 @@ export async function GET(request: NextRequest) {
     });
   } else {
     // Return session info for creator (all participants)
-    const participantsObj: Record<string, {
-      answer?: RTCSessionDescriptionInit;
-      participantIce: RTCIceCandidateInit[];
-      lastSeen: number;
-    }> = {};
+    const participantsObj: Record<string, any> = {};
     
     // Convert Map to object for JSON response
     for (const [pid, pData] of connection.participants.entries()) {
