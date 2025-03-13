@@ -108,6 +108,45 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'Offer is required' }, { status: 400 });
   }
 
+  // Check for existing session with the same SDP
+  const now = Date.now();
+  const threshold = 30 * 60 * 1000; // 30 minutes
+  let existingSessionId = null;
+  
+  // Look for a recently created session from the same peer
+  for (const [sessionId, session] of connections.entries()) {
+    // Skip sessions older than threshold
+    let anyRecentParticipants = false;
+    for (const participant of session.participants.values()) {
+      if (now - participant.lastSeen < threshold) {
+        anyRecentParticipants = true;
+        break;
+      }
+    }
+    
+    // If session has offer SDP and is recent, it's likely from the same creator
+    if (session.offer?.sdp === body.offer.sdp) {
+      console.log(`Found existing session with matching offer: ${sessionId}`);
+      existingSessionId = sessionId;
+      break;
+    }
+  }
+  
+  // If we found an existing session, return that
+  if (existingSessionId) {
+    console.log(`Returning existing session ID: ${existingSessionId}`);
+    
+    // Update offer just in case there were changes
+    const existingSession = connections.get(existingSessionId);
+    if (existingSession) {
+      existingSession.offer = body.offer;
+      // Don't clear ICE candidates, they might still be valid
+    }
+    
+    return NextResponse.json({ sessionId: existingSessionId });
+  }
+  
+  // Create new session if no existing one found
   const sessionId = generateId();
   
   connections.set(sessionId, {

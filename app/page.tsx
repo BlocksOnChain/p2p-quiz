@@ -6,6 +6,7 @@ import { useSearchParams, useRouter } from 'next/navigation';
 import { Inter } from 'next/font/google';
 import { QRCodeSVG } from 'qrcode.react';
 import { getHostAddress } from '@/lib/utils';
+import P2PStatus from '@/app/components/p2p-status';
 
 const inter = Inter({ subsets: ['latin'] });
 
@@ -41,6 +42,82 @@ interface DraftQuiz {
   timeLimit: number;
   points: number;
 }
+
+// Add a StatusBar component to display connection information
+const StatusBar = ({ 
+  connectionStatus, 
+  heartbeatStatus, 
+  messageSendingStatus,
+  isLoading,
+  onReconnect
+}: { 
+  connectionStatus: string; 
+  heartbeatStatus: string; 
+  messageSendingStatus: string;
+  isLoading: boolean;
+  onReconnect: () => void;
+}) => {
+  return (
+    <div className="flex items-center gap-2">
+      <div className={`w-3 h-3 rounded-full ${
+        connectionStatus === 'connected' 
+          ? heartbeatStatus === 'connected' 
+            ? 'bg-green-500 animate-pulse' 
+            : heartbeatStatus === 'reconnecting' 
+              ? 'bg-yellow-500 animate-pulse' 
+              : 'bg-red-500 animate-pulse'
+          : connectionStatus === 'connecting'
+            ? 'bg-blue-500 animate-pulse'
+            : 'bg-red-500 animate-pulse'
+      }`}></div>
+      <span className={`${
+        connectionStatus === 'connected' 
+          ? heartbeatStatus === 'connected' 
+            ? 'text-green-600' 
+            : heartbeatStatus === 'reconnecting' 
+              ? 'text-yellow-600' 
+              : 'text-red-600'
+          : connectionStatus === 'connecting'
+            ? 'text-blue-600'
+            : 'text-red-600'
+      } font-semibold`}>
+        {connectionStatus === 'connected' 
+          ? heartbeatStatus === 'connected' 
+            ? 'Connected' 
+            : heartbeatStatus === 'reconnecting' 
+              ? 'Connection unstable - attempting to reconnect...' 
+              : 'Connection unstable'
+          : connectionStatus === 'connecting' 
+            ? 'Establishing connection...' 
+            : 'Disconnected'
+        }
+        {messageSendingStatus === 'sending' && ' (Sending data...)'}
+        {messageSendingStatus === 'failed' && ' (Data send failed)'}
+      </span>
+      
+      {/* Manual reconnect button */}
+      {(connectionStatus === 'disconnected' || heartbeatStatus === 'disconnected' || heartbeatStatus === 'reconnecting') && (
+        <button 
+          onClick={onReconnect}
+          disabled={isLoading}
+          className="ml-2 px-3 py-1 bg-blue-500 hover:bg-blue-600 text-white text-sm rounded disabled:opacity-50 disabled:cursor-not-allowed flex items-center"
+        >
+          {isLoading ? (
+            <>
+              <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+              Reconnecting...
+            </>
+          ) : (
+            'Reconnect'
+          )}
+        </button>
+      )}
+    </div>
+  );
+};
 
 function HomeContent() {
   const searchParams = useSearchParams();
@@ -111,43 +188,61 @@ function HomeContent() {
       reliableSenderRef.current = sendReliable;
     }
 
+    // Reset last heartbeat time to now
     lastHeartbeatResponseRef.current = Date.now();
     
+    // Set initial status as connected since we just established the connection
+    setHeartbeatStatus('connected');
+    setConnectionStatus('connected');
+    
+    // Track missed heartbeats
+    let missedHeartbeats = 0;
+    const MAX_MISSED_HEARTBEATS = 3;
+      
     heartbeatIntervalRef.current = setInterval(() => {
       // Check if we've received a response recently
       const timeSinceLastResponse = Date.now() - lastHeartbeatResponseRef.current;
       
-      if (timeSinceLastResponse > 10000) { // 10 seconds
-        // Haven't received a response for too long
-        setHeartbeatStatus('disconnected');
-        setConnectionStatus('disconnected');
-      } else if (timeSinceLastResponse > 5000) { // 5 seconds
-        // Getting concerning, mark as reconnecting
-        setHeartbeatStatus('reconnecting');
+      if (timeSinceLastResponse > 8000) { // 8 seconds without response
+        missedHeartbeats++;
+        console.log(`[Heartbeat] Missed ${missedHeartbeats} heartbeats. Last response: ${timeSinceLastResponse}ms ago`);
+        
+        if (missedHeartbeats >= MAX_MISSED_HEARTBEATS) {
+          // Too many missed heartbeats, mark as disconnected
+          setHeartbeatStatus('disconnected');
+          
+          // Only set connection status to disconnected if WebRTC also reports disconnected
+          if (channel.readyState !== 'open' || 
+              (channel === dataChannelRef.current.get(creatorSessionId) && 
+               creatorPeerRef.current.get(creatorSessionId)?.connectionState !== 'connected')) {
+            setConnectionStatus('disconnected');
+            console.log('[Heartbeat] Connection appears to be fully disconnected, updating UI');
+          }
+        } else if (missedHeartbeats >= 1) {
+          // At least one missed heartbeat, mark as reconnecting
+          setHeartbeatStatus('reconnecting');
+          console.log('[Heartbeat] Connection appears unstable, marking as reconnecting');
+        }
       }
       
       // Send new heartbeat
       try {
-        // Try using reliable message if available
-        if (reliableSenderRef.current) {
-          reliableSenderRef.current({
-            type: 'heartbeat',
-            timestamp: Date.now()
-          });
-        } else if (channel.readyState === 'open') {
-          // Fallback to regular send
+        if (channel.readyState === 'open') {
+          // Always use direct channel send for heartbeats - they don't need reliability guarantees
+          // and we want to minimize overhead for this frequent operation
           channel.send(JSON.stringify({
             type: 'heartbeat',
             timestamp: Date.now()
           }));
+        } else {
+          console.log(`[Heartbeat] Channel not open (state: ${channel.readyState}), skipping heartbeat`);
+          missedHeartbeats++;
         }
       } catch (err) {
-        console.error('Failed to send heartbeat:', err);
+        console.error('[Heartbeat] Failed to send heartbeat:', err);
+        missedHeartbeats++;
       }
     }, 3000); // Send heartbeat every 3 seconds
-    
-    // Set initial status as connected
-    setHeartbeatStatus('connected');
     
     return () => {
       if (heartbeatIntervalRef.current) {
@@ -155,7 +250,7 @@ function HomeContent() {
         heartbeatIntervalRef.current = null;
       }
     };
-  }, []);
+  }, [creatorSessionId]);
 
   // Creator: create quiz & WebRTC connection
   const handleCreateQuiz = async () => {
@@ -174,19 +269,42 @@ function HomeContent() {
       creatorPeer.onconnectionstatechange = () => {
         const state = creatorPeer.connectionState;
         console.log("[Creator Frontend] Connection state changed:", state);
-        setConnectionStatus(state);
-        if (state === 'failed' || state === 'disconnected' || state === 'closed') {
-          setError('Connection to participant lost. They may need to reconnect.');
-          // Don't clear connected participants immediately as they may reconnect
-          // Instead, mark them as potentially disconnected via the heartbeat mechanism
-        } else if (state === 'connected') {
-          // Clear any existing error on successful connection
+        
+        // Check data channel state as well for more accurate status
+        const channelState = dataChannel.readyState;
+        console.log("[Creator Frontend] Data channel state:", channelState);
+        
+        if (state === 'connected' && channelState === 'open') {
+          setConnectionStatus('connected');
           setError(null);
           
-          // Only update connected participants if we have a valid session ID
-          if (typeof creatorSessionId === 'string' && creatorSessionId.length > 0) {
-            setConnectedParticipants(new Set([creatorSessionId]));
+          // If we were disconnected but reconnected, reset heartbeat status
+          if (heartbeatStatus === 'disconnected') {
+            setHeartbeatStatus('connected');
+            lastHeartbeatResponseRef.current = Date.now();
           }
+          
+          // Only update connected participants if we have a valid session ID
+          if (typeof sessionId === 'string' && sessionId.length > 0) {
+            setConnectedParticipants(prev => new Set(prev).add(sessionId));
+          }
+        } else if (state === 'failed' || state === 'closed') {
+          setConnectionStatus('disconnected');
+          setHeartbeatStatus('disconnected');
+          setError('Connection to participant lost. They may need to reconnect.');
+        } else if (state === 'disconnected') {
+          // Don't immediately set as disconnected, let the heartbeat mechanism verify
+          console.log("[Creator Frontend] Connection in disconnected state, waiting for heartbeat verification");
+          setHeartbeatStatus('reconnecting');
+          
+          // If still disconnected after 10 seconds, update the UI
+          setTimeout(() => {
+            if (creatorPeer.connectionState === 'disconnected' && 
+                (Date.now() - lastHeartbeatResponseRef.current > 10000)) {
+              setConnectionStatus('disconnected');
+              console.log("[Creator Frontend] Connection still disconnected after delay, updating UI");
+            }
+          }, 10000);
         }
       };
 
@@ -402,6 +520,8 @@ function HomeContent() {
   const [currentQuizId, setCurrentQuizId] = useState<string | null>(null);
   const [myAnswers, setMyAnswers] = useState<Map<string, string>>(new Map());
   const [participantId] = useState(() => Math.random().toString(36).substring(2));
+  // Store the original session ID to maintain connection across reconnects
+  const originalSessionIdRef = useRef<string | null>(null);
 
   const participantPeerRef = useRef<RTCPeerConnection | null>(null);
   const participantChannelRef = useRef<RTCDataChannel | null>(null);
@@ -409,6 +529,10 @@ function HomeContent() {
   // Join quiz when session ID is present
   useEffect(() => {
     if (sessionId && mode === 'participant') {
+      // Store the original session ID
+      if (!originalSessionIdRef.current) {
+        originalSessionIdRef.current = sessionId;
+      }
       handleJoinQuiz(sessionId);
     }
   }, [sessionId, mode]);
@@ -417,6 +541,16 @@ function HomeContent() {
   const handleJoinQuiz = async (sid: string) => {
     setError(null);
     setIsLoading(true);
+    
+    // Use the original session ID if we have one
+    const sessionToUse = originalSessionIdRef.current || sid;
+    
+    // Store this as the original session if we don't have one yet
+    if (!originalSessionIdRef.current) {
+      originalSessionIdRef.current = sessionToUse;
+    }
+    
+    console.log(`[Participant] Joining/Reconnecting to session: ${sessionToUse} with participant ID: ${participantId}`);
     
     // Clear any existing state to ensure fresh connection
     if (participantPeerRef.current) {
@@ -442,7 +576,8 @@ function HomeContent() {
     setHeartbeatStatus('disconnected');
     
     try {
-      const { participantPeer, getChannel, sendReliableMessage } = await joinConnection(sid, participantId);
+      // Use the stored session ID and participant ID for consistent reconnection
+      const { participantPeer, getChannel, sendReliableMessage } = await joinConnection(sessionToUse, participantId);
       participantPeerRef.current = participantPeer;
       
       // Store reliable sender
@@ -508,7 +643,7 @@ function HomeContent() {
       }
 
       // Start polling for updates
-      pollUpdates(sid, 'participant', participantPeer, participantId);
+      pollUpdates(sessionToUse, 'participant', participantPeer, participantId);
     } catch (err) {
       console.error("[Participant Frontend] Error joining quiz:", err);
       setError('Failed to join quiz session. The session may be invalid or expired.');
@@ -583,19 +718,24 @@ function HomeContent() {
           lastHeartbeatResponseRef.current = Date.now();
           setHeartbeatStatus('connected');
           
-          // Send heartbeat response back
-          if (reliableSenderRef.current) {
-            reliableSenderRef.current({
-              type: 'heartbeat',
-              timestamp: Date.now()
-            });
-          } else {
+          // Reset the connection status if it was previously disconnected
+          if (connectionStatus !== 'connected' && channel.readyState === 'open') {
+            console.log('[Heartbeat] Reconnected via heartbeat response');
+            setConnectionStatus('connected');
+          }
+          
+          // Send heartbeat response back immediately
+          try {
+            // Send heartbeat response directly (no need for reliable messaging)
             channel.send(JSON.stringify({
               type: 'heartbeat',
-              timestamp: Date.now()
+              timestamp: Date.now(),
+              isResponse: true // Mark as a response to avoid ping-pong
             }));
+          } catch (err) {
+            console.error('[Heartbeat] Failed to send heartbeat response:', err);
           }
-          return;
+          return; // Skip further processing for heartbeats
         }
         
         if (parsed.type === 'quiz') {
@@ -1023,45 +1163,6 @@ function HomeContent() {
     </div>
   );
 
-  // Add connection status indicator component
-  const renderConnectionStatus = () => {
-    return (
-      <div className="flex items-center gap-2">
-        <div className={`w-3 h-3 rounded-full ${
-          connectionStatus === 'connected' 
-            ? heartbeatStatus === 'connected' 
-              ? 'bg-green-500 animate-pulse' 
-              : heartbeatStatus === 'reconnecting' 
-                ? 'bg-yellow-500 animate-pulse' 
-                : 'bg-red-500 animate-pulse'
-            : 'bg-red-500 animate-pulse'
-        }`}></div>
-        <span className={`${
-          connectionStatus === 'connected' 
-            ? heartbeatStatus === 'connected' 
-              ? 'text-green-600' 
-              : heartbeatStatus === 'reconnecting' 
-                ? 'text-yellow-600' 
-                : 'text-red-600'
-            : 'text-red-600'
-        } font-semibold`}>
-          {connectionStatus === 'connected' 
-            ? heartbeatStatus === 'connected' 
-              ? 'Connected' 
-              : heartbeatStatus === 'reconnecting' 
-                ? 'Reconnecting...' 
-                : 'Connection unstable'
-            : connectionStatus === 'connecting' 
-              ? 'Connecting...' 
-              : 'Disconnected'
-          }
-          {messageSendingStatus === 'sending' && ' (Sending...)'}
-          {messageSendingStatus === 'failed' && ' (Send failed)'}
-        </span>
-      </div>
-    );
-  };
-
   // Add timer display for participants
   const renderTimer = () => {
     if (!currentQuiz?.timeLimit || quizTimer === null) return null;
@@ -1197,88 +1298,207 @@ function HomeContent() {
     );
   };
 
+  // Add a reconnection function
+  const attemptReconnection = useCallback(async () => {
+    console.log("[Reconnection] Attempting to reestablish connection");
+    setIsLoading(true);
+    
+    try {
+      // Only attempt reconnection if we're in creator mode and have a session ID
+      if (mode === 'creator' && creatorSessionId) {
+        // Check if the old connection is still usable
+        const oldPeer = creatorPeerRef.current.get(creatorSessionId);
+        if (oldPeer && 
+            (oldPeer.connectionState === 'connected' || oldPeer.iceConnectionState === 'connected')) {
+          console.log("[Reconnection] Existing connection still appears valid, skipping reconnection");
+          setConnectionStatus('connected');
+          setHeartbeatStatus('connected');
+          setIsLoading(false);
+          return;
+        }
+        
+        // For creator, if we're reconnecting we should use createConnection without expecting a new sessionId
+        // This ensures we keep using the same peer and just try to re-establish the connection
+        console.log("[Reconnection] Attempting to reconnect creator with existing session ID: ", creatorSessionId);
+        
+        // Close old connection
+        if (oldPeer) {
+          try {
+            oldPeer.close();
+          } catch (err) {
+            console.error("[Reconnection] Error closing old peer:", err);
+          }
+        }
+        
+        // Create a new connection but preserve the session ID
+        const { creatorPeer, dataChannel, sessionId, sendReliableMessage } = await createConnection();
+        
+        // Check if we got the same session ID back
+        if (sessionId !== creatorSessionId) {
+          console.warn("[Reconnection] Warning: Reconnected with new session ID. Original:", creatorSessionId, "New:", sessionId);
+        }
+        
+        // Store new connection objects
+        creatorPeerRef.current.set(sessionId, creatorPeer);
+        dataChannelRef.current.set(sessionId, dataChannel);
+        
+        // Only update session ID if it's different
+        if (sessionId !== creatorSessionId) {
+          setCreatorSessionId(sessionId);
+        }
+        
+        // Store the reliable message sender
+        reliableSenderRef.current = sendReliableMessage;
+        
+        // Set up new event handlers - calling setupDataChannel directly
+        // Since the function sets up handlers directly on the channel, no need to assign return value
+        setupDataChannel(dataChannel);
+        
+        // Start heartbeat with new channel
+        startHeartbeat(dataChannel, sendReliableMessage);
+        
+        console.log("[Reconnection] Connection reestablished successfully");
+        setConnectionStatus('connected');
+        setHeartbeatStatus('connected');
+        setError(null);
+      } else if (mode === 'participant' && sessionId) {
+        // For participant, use the original sessionId for reconnection
+        const sessionToUse = originalSessionIdRef.current || sessionId;
+        console.log("[Reconnection] Participant attempting to rejoin with consistent session ID:", sessionToUse);
+        
+        // Join the session with existing participant ID to maintain consistency
+        const { participantPeer, getChannel, sendReliableMessage } = await joinConnection(
+          sessionToUse,
+          participantId
+        );
+        
+        // Store the new participant peer
+        participantPeerRef.current = participantPeer;
+        
+        // Get the data channel
+        const channel = getChannel();
+        participantChannelRef.current = channel;
+        
+        // Set up data channel - call the function directly rather than using its return value
+        setupDataChannel(channel);
+        
+        // Start heartbeat
+        startHeartbeat(channel, sendReliableMessage);
+        
+        console.log("[Reconnection] Participant reconnected successfully");
+        setConnectionStatus('connected');
+        setHeartbeatStatus('connected');
+      }
+    } catch (err: any) { // Type the error as 'any' to access message property
+      console.error("[Reconnection] Failed to reconnect:", err);
+      setError(`Reconnection failed: ${err?.message || 'Unknown error'}. Please try again or refresh the page.`);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [mode, creatorSessionId, sessionId, setupDataChannel, startHeartbeat, participantId]);
+
+  // Add effect to monitor connection status and trigger reconnection
+  useEffect(() => {
+    // Only attempt automatic reconnection if we've been disconnected for a while
+    if (connectionStatus === 'disconnected' || heartbeatStatus === 'disconnected') {
+      const timer = setTimeout(() => {
+        console.log("[Auto-reconnect] Connection has been down, attempting reconnection");
+        attemptReconnection();
+      }, 15000); // Wait 15 seconds before attempting reconnection
+      
+      return () => clearTimeout(timer);
+    }
+  }, [connectionStatus, heartbeatStatus, attemptReconnection]);
+
+  // Update the return statement to use the P2PStatus component
   return (
-    <main className={`min-h-screen p-4 md:p-8 bg-gradient-to-br from-indigo-50 via-indigo-100 to-white ${inter.className}`}>
-      <div className="max-w-4xl mx-auto">
-        <h1 className="text-3xl md:text-4xl font-bold mb-6 md:mb-8 text-indigo-900 text-center">
-          Real-Time P2P Quiz
-        </h1>
+    <div className="min-h-screen pb-16">
+      {/* Add the P2PStatus component at the top, outside the main content */}
+      <P2PStatus
+        connectionStatus={connectionStatus}
+        heartbeatStatus={heartbeatStatus}
+        messageSendingStatus={messageSendingStatus}
+        isLoading={isLoading}
+        onReconnect={attemptReconnection}
+      />
+      
+      <main className={`min-h-screen p-4 pt-20 md:p-8 md:pt-24 bg-gradient-to-br from-indigo-50 via-indigo-100 to-white ${inter.className}`}>
+        <div className="max-w-4xl mx-auto">
+          <h1 className="text-3xl md:text-4xl font-bold mb-6 md:mb-8 text-indigo-900 text-center">
+            Real-Time P2P Quiz
+          </h1>
 
-        {error && (
-          <div className="mb-6 p-4 bg-red-50 border-2 border-red-200 rounded-lg shadow-sm">
-            <p className="text-red-800 font-medium">{error}</p>
-          </div>
-        )}
+          {error && (
+            <div className="error-message bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">
+              <strong className="font-bold">Error: </strong>
+              <span className="block sm:inline">{error}</span>
+            </div>
+          )}
 
-        <div className="bg-white rounded-xl shadow-lg p-6 md:p-8 mb-8 border border-gray-100">
-          <div className="flex flex-col md:flex-row md:items-center gap-4 mb-6 border-b border-gray-100 pb-4">
-            <div className="flex-1">
-              <h2 className="text-xl font-bold text-indigo-900 mb-1">
-                {mode === 'creator' ? 'Quiz Creator' : 'Quiz Participant'}
-              </h2>
-              <div className="flex items-center mt-2">
-                {renderConnectionStatus()}
+          <div className="bg-white rounded-xl shadow-lg p-6 md:p-8 mb-8 border border-gray-100">
+            <div className="flex flex-col md:flex-row md:items-center gap-4 mb-6 border-b border-gray-100 pb-4">
+              <div className="flex-1">
+                <h2 className="text-xl font-bold text-indigo-900 mb-1">
+                  {mode === 'creator' ? 'Quiz Creator' : 'Quiz Participant'}
+                </h2>
               </div>
+              {!sessionId && (
+                <button
+                  onClick={() => setMode(mode === 'creator' ? 'participant' : 'creator')}
+                  className="px-5 py-2.5 text-sm font-medium text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-lg hover:bg-indigo-100 transition-colors"
+                >
+                  Switch to {mode === 'creator' ? 'Participant' : 'Creator'} Mode
+                </button>
+              )}
             </div>
-            {!sessionId && (
-              <button
-                onClick={() => setMode(mode === 'creator' ? 'participant' : 'creator')}
-                className="px-5 py-2.5 text-sm font-medium text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-lg hover:bg-indigo-100 transition-colors"
-              >
-                Switch to {mode === 'creator' ? 'Participant' : 'Creator'} Mode
-              </button>
-            )}
-          </div>
 
-          {isLoading ? (
-            <div className="text-center py-12">
-              <div className="inline-block animate-spin rounded-full h-10 w-10 border-4 border-indigo-300 border-t-indigo-600 mb-4"></div>
-              <p className="text-indigo-800 font-medium text-lg">
-                {mode === 'creator' ? 'Creating quiz session...' : 'Joining quiz session...'}
-              </p>
-              <p className="text-gray-500 mt-2">This may take a few moments</p>
-            </div>
-          ) : mode === 'creator' ? (
-            renderCreatorUI()
-          ) : (
+            {isLoading ? (
+              <div className="text-center py-12">
+                <div className="inline-block animate-spin rounded-full h-10 w-10 border-4 border-indigo-300 border-t-indigo-600 mb-4"></div>
+                <p className="text-indigo-800 font-medium text-lg">
+                  {mode === 'creator' ? 'Creating quiz session...' : 'Joining quiz session...'}
+                </p>
+                <p className="text-gray-500 mt-2">This may take a few moments</p>
+              </div>
+            ) : mode === 'creator' ? (
+              renderCreatorUI()
+            ) : (
               <div className="space-y-6">
-              {receivedQuizzes.length > 0 ? (
-                <>
-                  {/* Quiz Navigation */}
-                  {receivedQuizzes.length > 1 && (
-                    <div className="mb-6">
-                      <h3 className="text-base font-medium text-gray-700 mb-3">Select a Question:</h3>
-                      <div className="flex gap-2 flex-wrap">
-                        {receivedQuizzes.map((quiz, index) => {
-                          const hasAnswer = scores.has(quiz.id);
-                          return (
-                            <button
-                              key={quiz.id}
-                              onClick={() => setCurrentQuizId(quiz.id)}
-                              className={`px-4 py-2 rounded-lg transition-all ${
-                                currentQuizId === quiz.id
+                {receivedQuizzes.length > 0 ? (
+                  <>
+                    {/* Quiz Navigation */}
+                    {receivedQuizzes.length > 1 && (
+                      <div className="mb-6">
+                        <h3 className="text-base font-medium text-gray-700 mb-3">Select a Question:</h3>
+                        <div className="flex gap-2 flex-wrap">
+                          {receivedQuizzes.map((quiz, index) => {
+                            const hasAnswer = scores.has(quiz.id);
+                            return (
+                              <button
+                                key={quiz.id}
+                                onClick={() => setCurrentQuizId(quiz.id)}
+                                className={`px-4 py-2 rounded-lg transition-all ${currentQuizId === quiz.id
                                   ? 'bg-indigo-600 text-white shadow-md'
                                   : hasAnswer
                                     ? 'bg-green-100 text-green-800 border border-green-300'
                                     : 'bg-gray-100 text-gray-700 hover:bg-gray-200 border border-gray-200'
-                              }`}
-                            >
-                              Q{index + 1}
-                              {hasAnswer && (
-                                <svg className="w-4 h-4 ml-1 inline-block" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                                </svg>
-                              )}
-                            </button>
-                          );
-                        })}
+                                }`}
+                              >
+                                Q{index + 1}
+                                {hasAnswer && (
+                                  <svg className="w-4 h-4 ml-1 inline-block" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                                  </svg>
+                                )}
+                              </button>
+                            );
+                          })}
+                        </div>
                       </div>
-                    </div>
-                  )}
+                    )}
 
-                  {/* Current Quiz */}
-                  {renderCurrentQuiz()}
-                </>
+                    {renderCurrentQuiz()}
+                  </>
                 ) : connectionStatus === 'connected' ? (
                   <div className="text-center py-16">
                     <div className="w-24 h-24 mx-auto mb-6 rounded-full bg-indigo-100 flex items-center justify-center">
@@ -1321,14 +1541,11 @@ function HomeContent() {
                   </div>
                 )}
               </div>
-          )}
+            )}
+          </div>
         </div>
-        
-        <footer className="text-center text-sm text-gray-500 mt-8 pb-6">
-          <p>Real-Time P2P Quiz | Powered by WebRTC</p>
-        </footer>
-      </div>
-    </main>
+      </main>
+    </div>
   );
 }
 

@@ -577,7 +577,8 @@ export async function createConnection() {
     // Enhanced connection state monitoring
     let connectionMonitorInterval: NodeJS.Timeout | null = null;
     let lastStateChange = Date.now();
-    const MAX_STATE_DURATION = 15000; // Increased from 10000 to 15000ms
+    const MAX_STATE_DURATION = 15000; // 15 seconds
+    const CONNECTION_CHECK_INTERVAL = 3000; // Check every 3 seconds instead of 2
 
     const monitorConnection = () => {
       if (connectionMonitorInterval) clearInterval(connectionMonitorInterval);
@@ -586,8 +587,17 @@ export async function createConnection() {
         const currentTime = Date.now();
         const stateDuration = currentTime - lastStateChange;
 
+        // Log connection state periodically for debugging
+        console.log(`[Creator] Connection monitoring - state: ${creatorPeer.connectionState}, ice state: ${creatorPeer.iceConnectionState}, data channel: ${dataChannel.readyState}, duration: ${stateDuration}ms`);
+
         if (creatorPeer.connectionState === 'disconnected' && stateDuration > MAX_STATE_DURATION) {
           console.log("[Creator] Connection stuck in disconnected state, attempting recovery");
+          handleConnectionRecovery();
+        }
+
+        // Check for long-lasting connecting state
+        if (creatorPeer.connectionState === 'connecting' && stateDuration > 20000) {
+          console.log("[Creator] Connection stuck in connecting state, attempting recovery");
           handleConnectionRecovery();
         }
 
@@ -596,23 +606,58 @@ export async function createConnection() {
           console.log("[Creator] ICE connection issues detected, attempting recovery");
           handleConnectionRecovery();
         }
-      }, 2000);
+        
+        // Check if data channel is closed but peer is still connected
+        if (dataChannel.readyState === 'closed' && creatorPeer.connectionState === 'connected') {
+          console.log("[Creator] Data channel closed while peer connected, attempting to reopen");
+          try {
+            const newDataChannel = creatorPeer.createDataChannel("quizChannel", {
+              ordered: true,
+              maxRetransmits: 30,
+              protocol: 'quiz',
+              negotiated: true,
+              id: 0
+            });
+            // Copy event handlers from the old channel
+            newDataChannel.onopen = dataChannel.onopen;
+            newDataChannel.onclose = dataChannel.onclose;
+            newDataChannel.onerror = dataChannel.onerror;
+            newDataChannel.onmessage = dataChannel.onmessage;
+            
+            // Replace the data channel reference
+            Object.assign(dataChannel, newDataChannel);
+            console.log("[Creator] Data channel reopened");
+          } catch (err) {
+            console.error("[Creator] Failed to reopen data channel:", err);
+          }
+        }
+      }, CONNECTION_CHECK_INTERVAL);
     };
 
     const handleConnectionRecovery = async () => {
       console.log("[Creator] Starting connection recovery process");
       
-      if (creatorPeer.connectionState === 'failed' || creatorPeer.connectionState === 'disconnected') {
+      // Add a random delay before starting recovery to avoid stampede
+      const recoveryDelay = Math.floor(Math.random() * 2000) + 1000; // 1-3 seconds
+      await new Promise(resolve => setTimeout(resolve, recoveryDelay));
+      
+      if (creatorPeer.connectionState === 'failed' || 
+          creatorPeer.connectionState === 'disconnected' ||
+          creatorPeer.iceConnectionState === 'failed') {
         try {
+          console.log("[Creator] Creating recovery offer with ICE restart");
           // First try ICE restart
           const offer = await creatorPeer.createOffer({ 
             iceRestart: true,
             offerToReceiveAudio: false,
             offerToReceiveVideo: false
           });
+          
+          console.log("[Creator] Setting local description for recovery");
           await creatorPeer.setLocalDescription(offer);
           
           // Send the new offer to signaling server
+          console.log("[Creator] Sending recovery offer to signaling server");
           const response = await fetch('/api/signal', {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
@@ -630,6 +675,31 @@ export async function createConnection() {
           
           console.log("[Creator] Recovery offer sent successfully");
           lastStateChange = Date.now();
+          
+          // Try to reopen the data channel after recovery if it's closed
+          if (dataChannel.readyState === 'closed') {
+            try {
+              console.log("[Creator] Attempting to recreate data channel after recovery");
+              const newDataChannel = creatorPeer.createDataChannel("quizChannel", {
+                ordered: true,
+                maxRetransmits: 30,
+                protocol: 'quiz',
+                negotiated: true,
+                id: 0
+              });
+              
+              // Copy event handlers from the old channel
+              newDataChannel.onopen = dataChannel.onopen;
+              newDataChannel.onclose = dataChannel.onclose;
+              newDataChannel.onerror = dataChannel.onerror;
+              newDataChannel.onmessage = dataChannel.onmessage;
+              
+              // Replace the data channel reference
+              Object.assign(dataChannel, newDataChannel);
+            } catch (channelErr) {
+              console.error("[Creator] Failed to recreate data channel after recovery:", channelErr);
+            }
+          }
         } catch (err) {
           console.error("[Creator] Recovery attempt failed:", err);
         }
@@ -639,17 +709,59 @@ export async function createConnection() {
     // Update connection state handler
     creatorPeer.onconnectionstatechange = () => {
       const state = creatorPeer.connectionState;
-      console.log("[Creator] Connection state:", state);
+      const prevState = lastStateChange > 0 ? state : 'new'; // Track the previous state for better logging
+      console.log(`[Creator] Connection state changed: ${prevState} -> ${state}`);
       lastStateChange = Date.now();
 
       if (state === 'connected') {
         console.log("[Creator] Connection established successfully");
+        
+        // When connection is established, verify that the data channel is open
+        if (dataChannel.readyState !== 'open') {
+          console.log(`[Creator] Data channel not open (${dataChannel.readyState}), attempting to reopen`);
+          try {
+            const newDataChannel = creatorPeer.createDataChannel("quizChannel", {
+              ordered: true,
+              maxRetransmits: 30,
+              protocol: 'quiz',
+              negotiated: true,
+              id: 0
+            });
+            // Copy event handlers
+            newDataChannel.onopen = dataChannel.onopen;
+            newDataChannel.onclose = dataChannel.onclose;
+            newDataChannel.onerror = dataChannel.onerror;
+            newDataChannel.onmessage = dataChannel.onmessage;
+            
+            // Replace reference
+            Object.assign(dataChannel, newDataChannel);
+          } catch (err) {
+            console.error("[Creator] Failed to recreate data channel:", err);
+          }
+        }
       } else if (state === 'disconnected') {
         console.log("[Creator] Connection disconnected, monitoring for recovery");
         monitorConnection();
+        
+        // Start a timer to check if we successfully recover
+        setTimeout(() => {
+          if (creatorPeer.connectionState === 'disconnected') {
+            console.log("[Creator] Still disconnected after timeout, attempting active recovery");
+            handleConnectionRecovery();
+          }
+        }, 5000); // Wait 5 seconds before trying active recovery
       } else if (state === 'failed') {
         console.log("[Creator] Connection failed, attempting immediate recovery");
         handleConnectionRecovery();
+      } else if (state === 'connecting') {
+        console.log("[Creator] Connection is being established");
+        // Set a timeout to ensure we don't get stuck in connecting state
+        setTimeout(() => {
+          if (creatorPeer.connectionState === 'connecting') {
+            console.log("[Creator] Connection stuck in connecting state, attempting recovery");
+            handleConnectionRecovery();
+          }
+        }, 20000); // Wait 20 seconds in connecting state before recovery
       }
     };
 
@@ -763,10 +875,7 @@ export async function joinConnection(sessionId: string, participantId: string) {
         await participantPeer.setRemoteDescription(session.offer);
         
         // Create new answer
-        const answer = await participantPeer.createAnswer({
-          offerToReceiveAudio: false,
-          offerToReceiveVideo: false
-        });
+        const answer = await participantPeer.createAnswer();
         await participantPeer.setLocalDescription(answer);
         
         // Send new answer to signaling server
@@ -985,10 +1094,7 @@ export async function joinConnection(sessionId: string, participantId: string) {
 
   // Create and set local description (answer)
   console.log("[Participant] Creating answer");
-  const answer = await participantPeer.createAnswer({
-    offerToReceiveAudio: false,
-    offerToReceiveVideo: false
-  });
+  const answer = await participantPeer.createAnswer();
   await participantPeer.setLocalDescription(answer);
   console.log("[Participant] Local description (answer) set");
 
@@ -1102,12 +1208,25 @@ export async function pollUpdates(
   const MAX_FAILURES = 5;
   let pollingInterval = 1000; // Start with 1 second
   const MAX_POLLING_INTERVAL = 5000; // Max 5 seconds
+  const TOTAL_POLLING_DURATION = 10 * 60 * 1000; // Poll for 10 minutes
+  const startTime = Date.now();
 
   // Use let instead of const for interval so we can reassign it
   let interval = setInterval(pollFunction, pollingInterval);
 
   // Define the polling function that will be called at each interval
   async function pollFunction() {
+    // Check if we've been polling for too long
+    const elapsedTime = Date.now() - startTime;
+    
+    // Only stop polling if peer is not connected and we've reached maximum duration
+    if (elapsedTime > TOTAL_POLLING_DURATION && peer.connectionState !== 'connected') {
+      console.log(`[${role}] Maximum polling duration (${TOTAL_POLLING_DURATION/60000} minutes) reached for session ${sessionId}, stopping automatic polling.`);
+      console.log(`[${role}] User may need to manually reconnect or create new session.`);
+      clearInterval(interval);
+      return;
+    }
+    
     try {
       // If we have too many consecutive failures, increase polling interval
       if (consecutiveFailures >= MAX_FAILURES) {
@@ -1115,7 +1234,7 @@ export async function pollUpdates(
         console.log(`[${role}] Too many consecutive failures, increasing polling interval to ${pollingInterval}ms`);
         clearInterval(interval);
         interval = setInterval(pollFunction, pollingInterval);
-        consecutiveFailures = 0; // Reset after adjusting
+        consecutiveFailures = Math.floor(MAX_FAILURES / 2); // Reduce to half to allow recovery
         return; // Skip this iteration after rescheduling
       }
 
@@ -1152,6 +1271,14 @@ export async function pollUpdates(
           console.warn(`[${role}] Could not read response text:`, textError);
         }
         
+        // For 404 errors when participant trying to connect, retry with increasing backoff 
+        // but don't stop polling - session might be created later
+        if (status === 404 && role === 'participant') {
+          consecutiveFailures++;
+          console.log(`[${role}] Session not found (${status}), waiting for creator to establish session...`);
+          return;
+        }
+        
         throw new Error(
           `Failed to poll updates: ${status} ${statusText}. ` + 
           `URL: ${url.toString()}. ` +
@@ -1163,6 +1290,11 @@ export async function pollUpdates(
       consecutiveFailures = 0;
 
       const session = await response.json();
+
+      // If the session contains no data, it's pending participant connection
+      if (role === 'creator' && session.participants && Object.keys(session.participants).length === 0) {
+        console.log(`[${role}] No participants have joined yet, continuing to poll...`);
+      }
 
       if (role === 'creator' && session.participants) {
         // Handle new participants and their ICE candidates
@@ -1233,10 +1365,13 @@ export async function pollUpdates(
         }
       }
 
-      // Check if connection is established - if so, we can stop polling
+      // Check if connection is established - if so, we can reduce polling frequency but not stop it
       if (peer.connectionState === 'connected' && peer.iceConnectionState === 'connected') {
-        console.log(`[${role}] Connection fully established, stopping polling`);
+        console.log(`[${role}] Connection fully established, reducing polling frequency`);
+        // Reduce polling but don't stop completely to handle any reconnection needs
         clearInterval(interval);
+        pollingInterval = 5000; // Longer interval when connected
+        interval = setInterval(pollFunction, pollingInterval);
       }
     } catch (error) {
       // Increment failure counter
