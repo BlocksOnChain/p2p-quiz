@@ -182,26 +182,76 @@ function HomeContent() {
     if (heartbeatIntervalRef.current) {
       clearInterval(heartbeatIntervalRef.current);
     }
-
+    
     // Store the reliable sender if provided
     if (sendReliable) {
       reliableSenderRef.current = sendReliable;
     }
-
-    // Reset last heartbeat time to now
+    
+    const MAX_MISSED_HEARTBEATS = 3;
+    let missedHeartbeats = 0;
     lastHeartbeatResponseRef.current = Date.now();
     
-    // Set initial status as connected since we just established the connection
-    setHeartbeatStatus('connected');
-    setConnectionStatus('connected');
+    // Initial update of heartbeat status based on channel state
+    if (channel.readyState === 'open') {
+      setHeartbeatStatus('connected');
+    } else {
+      setHeartbeatStatus('reconnecting');
+    }
     
-    // Track missed heartbeats
-    let missedHeartbeats = 0;
-    const MAX_MISSED_HEARTBEATS = 3;
+    // Set up message handler for heartbeat responses if it doesn't exist
+    const originalOnMessage = channel.onmessage;
+    channel.onmessage = function(event) {
+      // Call original handler if exists
+      if (originalOnMessage) {
+        originalOnMessage.call(this, event);
+      }
       
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === 'heartbeat') {
+          // Update last heartbeat response timestamp
+          lastHeartbeatResponseRef.current = Date.now();
+          missedHeartbeats = 0;
+          
+          // Update heartbeat status
+          if (heartbeatStatus !== 'connected') {
+            setHeartbeatStatus('connected');
+            
+            // If the WebRTC connectionState is still disconnected but we're receiving heartbeats,
+            // update the connectionStatus to connected as well
+            if (connectionStatus !== 'connected') {
+              setConnectionStatus('connected');
+              console.log('[Heartbeat] Received heartbeat while connection state is not connected, updating UI');
+            }
+          }
+        }
+      } catch (err) {
+        // Ignore parsing errors for non-JSON messages
+      }
+    };
+    
     heartbeatIntervalRef.current = setInterval(() => {
       // Check if we've received a response recently
       const timeSinceLastResponse = Date.now() - lastHeartbeatResponseRef.current;
+      
+      // Check data channel state first - no point in trying if it's closed
+      if (channel.readyState !== 'open') {
+        missedHeartbeats++;
+        console.log(`[Heartbeat] Data channel not open (${channel.readyState}), counting as missed heartbeat #${missedHeartbeats}`);
+        
+        if (missedHeartbeats >= MAX_MISSED_HEARTBEATS) {
+          setHeartbeatStatus('disconnected');
+          // Only update connection status if we're sure we've lost connection
+          if (connectionStatus !== 'disconnected' && missedHeartbeats >= MAX_MISSED_HEARTBEATS + 2) {
+            setConnectionStatus('disconnected');
+            console.log('[Heartbeat] Multiple heartbeats missed and channel closed, updating UI to disconnected');
+          }
+        } else {
+          setHeartbeatStatus('reconnecting');
+        }
+        return; // Skip sending if channel is closed
+      }
       
       if (timeSinceLastResponse > 8000) { // 8 seconds without response
         missedHeartbeats++;
@@ -212,9 +262,11 @@ function HomeContent() {
           setHeartbeatStatus('disconnected');
           
           // Only set connection status to disconnected if WebRTC also reports disconnected
-          if (channel.readyState !== 'open' || 
+          // AND we've missed several heartbeats (not just the minimum)
+          if (missedHeartbeats >= MAX_MISSED_HEARTBEATS + 2 && 
+              (channel.readyState !== 'open' || 
               (channel === dataChannelRef.current.get(creatorSessionId) && 
-               creatorPeerRef.current.get(creatorSessionId)?.connectionState !== 'connected')) {
+               creatorPeerRef.current.get(creatorSessionId)?.connectionState !== 'connected'))) {
             setConnectionStatus('disconnected');
             console.log('[Heartbeat] Connection appears to be fully disconnected, updating UI');
           }
@@ -222,6 +274,17 @@ function HomeContent() {
           // At least one missed heartbeat, mark as reconnecting
           setHeartbeatStatus('reconnecting');
           console.log('[Heartbeat] Connection appears unstable, marking as reconnecting');
+        }
+      } else if (missedHeartbeats > 0) {
+        // We've received a recent response, reset missed heartbeats
+        console.log('[Heartbeat] Resetting missed heartbeats count, connection appears stable');
+        missedHeartbeats = 0;
+        setHeartbeatStatus('connected');
+        
+        // If connection status is disconnected but we're getting heartbeats,
+        // update it to connected since the data channel is working
+        if (connectionStatus !== 'connected') {
+          setConnectionStatus('connected');
         }
       }
       
@@ -242,7 +305,7 @@ function HomeContent() {
         console.error('[Heartbeat] Failed to send heartbeat:', err);
         missedHeartbeats++;
       }
-    }, 3000); // Send heartbeat every 3 seconds
+    }, 3000);
     
     return () => {
       if (heartbeatIntervalRef.current) {
@@ -250,7 +313,7 @@ function HomeContent() {
         heartbeatIntervalRef.current = null;
       }
     };
-  }, [creatorSessionId]);
+  }, [creatorSessionId, connectionStatus, heartbeatStatus]);
 
   // Creator: create quiz & WebRTC connection
   const handleCreateQuiz = async () => {
@@ -288,6 +351,25 @@ function HomeContent() {
           if (typeof sessionId === 'string' && sessionId.length > 0) {
             setConnectedParticipants(prev => new Set(prev).add(sessionId));
           }
+        } else if (state === 'connecting') {
+          // When in connecting state, update UI to show connecting but don't change to disconnected
+          setConnectionStatus('connecting');
+          console.log("[Creator Frontend] Connection in connecting state, updating UI");
+          
+          // Check after a delay if we're still in connecting state
+          setTimeout(() => {
+            // If both checks pass, and we're still in connecting state after delay, 
+            // but data channel is open, consider it as connected
+            if (
+              creatorPeer.connectionState === 'connecting' && 
+              dataChannel.readyState === 'open'
+            ) {
+              console.log("[Creator Frontend] Connection still in connecting state but data channel is open, treating as connected");
+              setConnectionStatus('connected');
+              setHeartbeatStatus('connected');
+              lastHeartbeatResponseRef.current = Date.now();
+            }
+          }, 5000);
         } else if (state === 'failed' || state === 'closed') {
           setConnectionStatus('disconnected');
           setHeartbeatStatus('disconnected');
@@ -297,14 +379,26 @@ function HomeContent() {
           console.log("[Creator Frontend] Connection in disconnected state, waiting for heartbeat verification");
           setHeartbeatStatus('reconnecting');
           
-          // If still disconnected after 10 seconds, update the UI
-          setTimeout(() => {
-            if (creatorPeer.connectionState === 'disconnected' && 
-                (Date.now() - lastHeartbeatResponseRef.current > 10000)) {
-              setConnectionStatus('disconnected');
-              console.log("[Creator Frontend] Connection still disconnected after delay, updating UI");
-            }
-          }, 10000);
+          // Check if data channel is still open despite the disconnected state
+          if (dataChannel.readyState === 'open') {
+            console.log("[Creator Frontend] Connection in disconnected state but data channel is open, keeping connection status");
+            // Don't change the connection status yet, just update heartbeat
+            // This prevents unnecessary reconnection prompts
+          } else {
+            // If still disconnected after 5 seconds, update the UI
+            setTimeout(() => {
+              if (creatorPeer.connectionState === 'disconnected' && 
+                  dataChannel.readyState !== 'open' &&
+                  (Date.now() - lastHeartbeatResponseRef.current > 5000)) {
+                setConnectionStatus('disconnected');
+                console.log("[Creator Frontend] Connection still disconnected after delay, updating UI");
+              } else if (dataChannel.readyState === 'open') {
+                // If data channel is open, consider it connected regardless of WebRTC state
+                setConnectionStatus('connected');
+                console.log("[Creator Frontend] Data channel is open, treating as connected despite disconnected WebRTC state");
+              }
+            }, 5000); // Reduced from 10 seconds to 5 seconds for better responsiveness
+          }
         }
       };
 
@@ -587,15 +681,61 @@ function HomeContent() {
       participantPeer.onconnectionstatechange = () => {
         const state = participantPeer.connectionState;
         console.log("[Participant Frontend] Connection state changed:", state);
-        setConnectionStatus(state);
         
-        // Only update error if we're disconnected and not in a temporary state
-        if (state === 'failed' || state === 'closed') {
-          setError('Connection lost. Please try reconnecting.');
-        } else if (state === 'connected') {
+        // Get the data channel from our ref
+        const channel = participantChannelRef.current;
+        const channelState = channel ? channel.readyState : 'closed';
+        console.log("[Participant Frontend] Data channel state:", channelState);
+        
+        if (state === 'connected') {
+          setConnectionStatus('connected');
+          setHeartbeatStatus('connected');
           console.log("[Participant Frontend] Successfully connected to creator");
           // Clear any existing error on successful connection
           setError(null);
+          lastHeartbeatResponseRef.current = Date.now();
+        } else if (state === 'connecting') {
+          // When in connecting state, update UI to show connecting but don't mark as disconnected
+          setConnectionStatus('connecting');
+          console.log("[Participant Frontend] Connection in connecting state, updating UI");
+          
+          // Check after a delay if data channel is open despite still in connecting state
+          setTimeout(() => {
+            if (channel && channel.readyState === 'open') {
+              console.log("[Participant Frontend] Data channel is open while in connecting state, treating as connected");
+              setConnectionStatus('connected');
+              setHeartbeatStatus('connected');
+              lastHeartbeatResponseRef.current = Date.now();
+            }
+          }, 5000);
+        } else if (state === 'failed' || state === 'closed') {
+          setConnectionStatus('disconnected');
+          setHeartbeatStatus('disconnected');
+          setError('Connection lost. Please try reconnecting.');
+        } else if (state === 'disconnected') {
+          // Check if data channel is still open despite the disconnected state
+          if (channel && channel.readyState === 'open') {
+            console.log("[Participant Frontend] Connection in disconnected state but data channel is open, keeping connection status");
+            setHeartbeatStatus('reconnecting');
+            // Don't change the connection status yet, just update heartbeat status
+          } else {
+            setHeartbeatStatus('disconnected');
+            
+            // Use a shorter timeout for UI responsiveness
+            setTimeout(() => {
+              // Only set as disconnected if still in that state and no heartbeats received
+              if (participantPeer.connectionState === 'disconnected' && 
+                  (!channel || channel.readyState !== 'open') &&
+                  (Date.now() - lastHeartbeatResponseRef.current > 5000)) {
+                setConnectionStatus('disconnected');
+                setError('Connection to creator lost. Trying to reconnect...');
+              } else if (channel && channel.readyState === 'open') {
+                // If data channel is open, consider it connected regardless of WebRTC state
+                setConnectionStatus('connected');
+                setHeartbeatStatus('connected');
+              }
+            }, 5000);
+          }
         }
       };
 

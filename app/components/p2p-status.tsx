@@ -17,51 +17,85 @@ export default function P2PStatus({
   isLoading,
   onReconnect
 }: P2PStatusProps) {
+  // Derive effective connection status based on both connection and data channel state
+  const getStatusColor = () => {
+    if (connectionStatus === 'connected') {
+      if (heartbeatStatus === 'connected') return 'bg-green-500';
+      if (heartbeatStatus === 'reconnecting') return 'bg-yellow-500';
+      return 'bg-red-500';
+    } else if (connectionStatus === 'connecting') {
+      return 'bg-blue-500';
+    } else {
+      return 'bg-red-500';
+    }
+  };
+
+  const getStatusText = () => {
+    if (connectionStatus === 'connected') {
+      if (heartbeatStatus === 'connected') return 'Connected';
+      if (heartbeatStatus === 'reconnecting') return 'Connection unstable - attempting to recover...';
+      return 'Connection unstable';
+    } else if (connectionStatus === 'connecting') {
+      return 'Establishing connection...';
+    } else if (isLoading) {
+      return 'Attempting to reconnect...';
+    } else {
+      return 'Disconnected - waiting for connection';
+    }
+  };
+
+  const getStatusTextColor = () => {
+    if (connectionStatus === 'connected') {
+      if (heartbeatStatus === 'connected') return 'text-green-600';
+      if (heartbeatStatus === 'reconnecting') return 'text-yellow-600';
+      return 'text-red-600';
+    } else if (connectionStatus === 'connecting') {
+      return 'text-blue-600';
+    } else {
+      return 'text-red-600';
+    }
+  };
+
+  // Only show reconnect button when truly disconnected or in a problematic state
+  const shouldShowReconnect = () => {
+    if (isLoading) return false; // Don't show when already reconnecting
+    if (connectionStatus === 'connected' && heartbeatStatus === 'connected') return false;
+    if (connectionStatus === 'connecting' && !isDataChannelStalled()) return false;
+    
+    return connectionStatus === 'disconnected' || 
+           heartbeatStatus === 'disconnected' || 
+           (heartbeatStatus === 'reconnecting' && isDataChannelStalled());
+  };
+  
+  // Determine if we're in a stalled state that would benefit from manual reconnection
+  const isDataChannelStalled = () => {
+    // Consider it stalled if connection is unstable for more than a few seconds
+    // This is a heuristic and could be replaced with actual timing logic
+    return heartbeatStatus === 'reconnecting' || heartbeatStatus === 'disconnected';
+  };
+  
+  // Get connection quality level (0-3) based on connection status
+  const getConnectionQuality = () => {
+    if (connectionStatus === 'connected' && heartbeatStatus === 'connected') return 3;
+    if (connectionStatus === 'connected' && heartbeatStatus === 'reconnecting') return 2;
+    if (connectionStatus === 'connecting') return 1;
+    return 0;
+  };
+
   return (
     <div className="fixed top-0 left-0 right-0 bg-white border-b border-gray-200 px-6 py-4 shadow-lg flex items-center justify-between z-50">
       <div className="flex items-center gap-3">
-        <div className={`w-5 h-5 rounded-full ${
-          connectionStatus === 'connected' 
-            ? heartbeatStatus === 'connected' 
-              ? 'bg-green-500 animate-pulse' 
-              : heartbeatStatus === 'reconnecting' 
-                ? 'bg-yellow-500 animate-pulse' 
-                : 'bg-red-500 animate-pulse'
-            : connectionStatus === 'connecting'
-              ? 'bg-blue-500 animate-pulse'
-              : 'bg-red-500 animate-pulse'
-        }`}></div>
-        <span className={`${
-          connectionStatus === 'connected' 
-            ? heartbeatStatus === 'connected' 
-              ? 'text-green-600' 
-              : heartbeatStatus === 'reconnecting' 
-                ? 'text-yellow-600' 
-                : 'text-red-600'
-            : connectionStatus === 'connecting'
-              ? 'text-blue-600'
-              : 'text-red-600'
-        } font-semibold text-lg`}>
-          {connectionStatus === 'connected' 
-            ? heartbeatStatus === 'connected' 
-              ? 'Connected' 
-              : heartbeatStatus === 'reconnecting' 
-                ? 'Connection unstable - attempting to reconnect...' 
-                : 'Connection unstable'
-            : connectionStatus === 'connecting' 
-              ? 'Establishing connection...' 
-              : isLoading 
-                ? 'Attempting to reconnect...' 
-                : 'Disconnected - waiting for connection'
-          }
+        <div className={`w-5 h-5 rounded-full ${getStatusColor()} animate-pulse`}></div>
+        <span className={`${getStatusTextColor()} font-semibold text-lg`}>
+          {getStatusText()}
           {messageSendingStatus === 'sending' && ' (Sending data...)'}
           {messageSendingStatus === 'failed' && ' (Data send failed)'}
         </span>
       </div>
       
       <div className="flex items-center gap-3">
-        {/* Manual reconnect button */}
-        {(connectionStatus === 'disconnected' || heartbeatStatus === 'disconnected' || heartbeatStatus === 'reconnecting') && (
+        {/* Manual reconnect button - only show when it would be helpful */}
+        {shouldShowReconnect() && (
           <button 
             onClick={onReconnect}
             disabled={isLoading}
@@ -89,11 +123,13 @@ export default function P2PStatus({
               <div 
                 key={i}
                 className={`w-2.5 h-6 mx-0.5 rounded-sm ${
-                  (connectionStatus === 'connected' && heartbeatStatus === 'connected') 
-                    ? i < 3 ? 'bg-green-500' : 'bg-gray-300'
-                    : (connectionStatus === 'connected' && heartbeatStatus === 'reconnecting')
-                      ? i < 2 ? 'bg-yellow-500' : 'bg-gray-300'
-                      : i < 1 ? 'bg-red-500' : 'bg-gray-300'
+                  i < getConnectionQuality() 
+                    ? getConnectionQuality() === 3 
+                      ? 'bg-green-500' 
+                      : getConnectionQuality() === 2 
+                        ? 'bg-yellow-500' 
+                        : 'bg-red-500'
+                    : 'bg-gray-300'
                 }`}
               ></div>
             ))}
