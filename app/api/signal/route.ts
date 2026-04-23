@@ -1,50 +1,85 @@
 import { NextRequest, NextResponse } from 'next/server';
 
-// Store connections in memory
+// =====================================================================
+// In-memory signaling store.
+//
+// This file is developer-friendly but NOT production-hardened: the store
+// lives in the Node process memory so it only works with a single-instance
+// server. The public API:
+//
+//   POST /api/signal            { offer }                     -> { sessionId }
+//   PUT  /api/signal            { sessionId, role:'creator', offer?|ice? }
+//                                { sessionId, participantId, role:'participant', answer?|ice? }
+//   GET  /api/signal?session=X                          -> { participants: {...} }
+//   GET  /api/signal?session=X&participant=Y            -> { offer, creatorIce }
+//
+// Participants are created implicitly by their first PUT. GET never mutates
+// state beyond refreshing `lastSeen` for the polling participant.
+// =====================================================================
+
+type Participant = {
+  answer?: RTCSessionDescriptionInit;
+  participantIce: RTCIceCandidateInit[];
+  lastSeen: number;
+};
+
 type SessionConnection = {
   offer: RTCSessionDescriptionInit;
   creatorIce: RTCIceCandidateInit[];
-  participants: Map<string, {
-    answer?: RTCSessionDescriptionInit;
-    participantIce: RTCIceCandidateInit[];
-    lastSeen: number; // Add timestamp for tracking activity
-  }>;
+  participants: Map<string, Participant>;
+  createdAt: number;
+  lastSeen: number;
 };
 
-const connections = new Map<string, SessionConnection>();
+// Preserve the store across dev-mode hot reloads.
+const globalStore = globalThis as unknown as {
+  __p2pQuizConnections?: Map<string, SessionConnection>;
+  __p2pQuizCleanup?: ReturnType<typeof setInterval>;
+};
 
-// Helper to generate session ID
-function generateId(): string {
-  return Math.random().toString(36).substring(2, 10);
+const connections: Map<string, SessionConnection> =
+  globalStore.__p2pQuizConnections ?? new Map<string, SessionConnection>();
+globalStore.__p2pQuizConnections = connections;
+
+const SESSION_MAX_IDLE_MS = 24 * 60 * 60 * 1000;
+const CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+
+function generateSessionId(): string {
+  // 96 random bits encoded as hex for collision resistance.
+  const buf = new Uint8Array(12);
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    crypto.getRandomValues(buf);
+  } else {
+    for (let i = 0; i < buf.length; i++) buf[i] = Math.floor(Math.random() * 256);
+  }
+  return Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-// Helper to clean up old sessions (run periodically)
-function cleanupOldSessions() {
+function cleanupOldSessions(): void {
   const now = Date.now();
-  const MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
-  
   for (const [sessionId, session] of connections.entries()) {
-    // Check if this session is too old
-    let allParticipantsInactive = true;
-    
-    for (const [participantId, participant] of session.participants.entries()) {
-      if (now - participant.lastSeen < MAX_AGE) {
-        allParticipantsInactive = false;
-        break;
-      }
+    let lastActivity = session.lastSeen;
+    for (const p of session.participants.values()) {
+      if (p.lastSeen > lastActivity) lastActivity = p.lastSeen;
     }
-    
-    if (allParticipantsInactive) {
-      console.log(`Cleaning up inactive session: ${sessionId}`);
+    if (now - lastActivity > SESSION_MAX_IDLE_MS) {
+      console.log(`[signal] cleaning up idle session ${sessionId}`);
       connections.delete(sessionId);
     }
   }
 }
 
-// Run cleanup every hour
-setInterval(cleanupOldSessions, 60 * 60 * 1000);
+if (!globalStore.__p2pQuizCleanup) {
+  globalStore.__p2pQuizCleanup = setInterval(cleanupOldSessions, CLEANUP_INTERVAL_MS);
+}
 
-export async function GET(request: NextRequest) {
+function touch(session: SessionConnection): void {
+  session.lastSeen = Date.now();
+}
+
+// ---------- Handlers ----------
+
+export async function GET(request: NextRequest): Promise<NextResponse> {
   const searchParams = request.nextUrl.searchParams;
   const sessionId = searchParams.get('session');
   const participantId = searchParams.get('participant');
@@ -53,135 +88,141 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: 'Session ID is required' }, { status: 400 });
   }
 
-  const connection = connections.get(sessionId);
-  if (!connection) {
+  const session = connections.get(sessionId);
+  if (!session) {
     return NextResponse.json({ error: 'Session not found' }, { status: 404 });
   }
 
+  touch(session);
+
   if (participantId) {
-    // If the participant doesn't exist in this session yet, create a new entry
-    if (!connection.participants.has(participantId)) {
-      connection.participants.set(participantId, {
-        participantIce: [],
-        lastSeen: Date.now()
-      });
-    } else {
-      // Update last seen timestamp
-      const participant = connection.participants.get(participantId);
-      if (participant) {
-        participant.lastSeen = Date.now();
-        connection.participants.set(participantId, participant);
-      }
-    }
-    
-    // Return session info for this participant
-    const participant = connection.participants.get(participantId);
-    
+    // Refresh participant's lastSeen if we already know about them; do NOT
+    // auto-create here — participants only exist once they PUT their answer
+    // or an ICE candidate. This prevents random pollers from populating the
+    // creator's participants list.
+    const p = session.participants.get(participantId);
+    if (p) p.lastSeen = Date.now();
+
     return NextResponse.json({
-      offer: connection.offer,
-      creatorIce: connection.creatorIce,
-      participant: participant
-    });
-  } else {
-    // Return session info for creator (all participants)
-    const participantsObj: Record<string, any> = {};
-    
-    // Convert Map to object for JSON response
-    for (const [pid, pData] of connection.participants.entries()) {
-      participantsObj[pid] = {
-        answer: pData.answer,
-        participantIce: pData.participantIce,
-        lastSeen: pData.lastSeen
-      };
-    }
-    
-    return NextResponse.json({
-      participants: participantsObj
+      offer: session.offer,
+      creatorIce: session.creatorIce,
     });
   }
+
+  const participantsObj: Record<
+    string,
+    { answer?: RTCSessionDescriptionInit; participantIce: RTCIceCandidateInit[]; lastSeen: number }
+  > = {};
+  for (const [pid, p] of session.participants.entries()) {
+    participantsObj[pid] = {
+      answer: p.answer,
+      participantIce: p.participantIce,
+      lastSeen: p.lastSeen,
+    };
+  }
+  return NextResponse.json({ participants: participantsObj });
 }
 
-export async function POST(request: NextRequest) {
-  const body = await request.json();
-
-  if (!body.offer) {
-    return NextResponse.json({ error: 'Offer is required' }, { status: 400 });
+export async function POST(request: NextRequest): Promise<NextResponse> {
+  let body: { offer?: RTCSessionDescriptionInit };
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 });
   }
 
-  const sessionId = generateId();
-  
+  if (!body.offer || typeof body.offer.sdp !== 'string') {
+    return NextResponse.json({ error: 'Valid offer is required' }, { status: 400 });
+  }
+
+  const sessionId = generateSessionId();
+  const now = Date.now();
   connections.set(sessionId, {
     offer: body.offer,
     creatorIce: [],
-    participants: new Map()
+    participants: new Map(),
+    createdAt: now,
+    lastSeen: now,
   });
 
   return NextResponse.json({ sessionId });
 }
 
-export async function PUT(request: NextRequest) {
-  const body = await request.json();
-  const { sessionId, participantId, answer, ice, role } = body;
+export async function PUT(request: NextRequest): Promise<NextResponse> {
+  let body: {
+    sessionId?: string;
+    participantId?: string;
+    role?: 'creator' | 'participant';
+    answer?: RTCSessionDescriptionInit;
+    offer?: RTCSessionDescriptionInit;
+    ice?: RTCIceCandidateInit;
+  };
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 });
+  }
 
+  const { sessionId, participantId, answer, ice, offer, role } = body;
   if (!sessionId) {
     return NextResponse.json({ error: 'Session ID is required' }, { status: 400 });
   }
 
-  const connection = connections.get(sessionId);
-  if (!connection) {
+  const session = connections.get(sessionId);
+  if (!session) {
     return NextResponse.json({ error: 'Session not found' }, { status: 404 });
   }
 
-  // Handle ICE candidates
+  touch(session);
+
+  const getOrCreateParticipant = (pid: string): Participant => {
+    let p = session.participants.get(pid);
+    if (!p) {
+      p = { participantIce: [], lastSeen: Date.now() };
+      session.participants.set(pid, p);
+    }
+    return p;
+  };
+
+  // Creator renegotiation (e.g. ICE restart).
+  if (offer && role === 'creator') {
+    if (typeof offer.sdp !== 'string') {
+      return NextResponse.json({ error: 'Invalid offer' }, { status: 400 });
+    }
+    session.offer = offer;
+    // ICE candidates from the previous negotiation are no longer valid
+    // (new ufrag/pwd), so drop them and let fresh ones be published.
+    session.creatorIce = [];
+  }
+
+  // ICE candidate publication.
   if (ice) {
     if (role === 'creator') {
-      connection.creatorIce.push(ice);
+      session.creatorIce.push(ice);
     } else if (role === 'participant' && participantId) {
-      // Create participant entry if it doesn't exist
-      if (!connection.participants.has(participantId)) {
-        connection.participants.set(participantId, {
-          participantIce: [ice],
-          lastSeen: Date.now()
-        });
-      } else {
-        const participant = connection.participants.get(participantId);
-        if (participant) {
-          participant.participantIce.push(ice);
-          participant.lastSeen = Date.now();
-          connection.participants.set(participantId, participant);
-        }
-      }
+      const p = getOrCreateParticipant(participantId);
+      p.participantIce.push(ice);
+      p.lastSeen = Date.now();
     } else {
-      return NextResponse.json({ error: 'Invalid role or missing participant ID' }, { status: 400 });
+      return NextResponse.json(
+        { error: 'ICE requires role and (for participant) participantId' },
+        { status: 400 }
+      );
     }
   }
 
-  // Handle offer (renegotiation)
-  if (body.offer && role === 'creator') {
-    connection.offer = body.offer;
-    // Clear existing ICE candidates on renegotiation
-    connection.creatorIce = [];
-  }
-
-  // Handle answer
-  if (answer && participantId) {
-    // Allow updating answer for existing participant (reconnection scenario)
-    const existingParticipant = connection.participants.get(participantId);
-    
-    if (existingParticipant) {
-      existingParticipant.answer = answer;
-      existingParticipant.lastSeen = Date.now();
-      // Don't clear ICE candidates on reconnection, they might still be valid
-      connection.participants.set(participantId, existingParticipant);
-    } else {
-      // New participant
-      connection.participants.set(participantId, {
-        answer,
-        participantIce: [],
-        lastSeen: Date.now()
-      });
+  // Participant answer publication (supports updates during renegotiation).
+  if (answer) {
+    if (!participantId) {
+      return NextResponse.json({ error: 'participantId required for answer' }, { status: 400 });
     }
+    if (typeof answer.sdp !== 'string') {
+      return NextResponse.json({ error: 'Invalid answer' }, { status: 400 });
+    }
+    const p = getOrCreateParticipant(participantId);
+    p.answer = answer;
+    p.lastSeen = Date.now();
   }
 
   return NextResponse.json({ success: true });
-} 
+}

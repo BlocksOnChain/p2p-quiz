@@ -1,1214 +1,713 @@
-import { getHostAddress } from './utils';
+// =====================================================================
+// WebRTC connection helpers for the P2P quiz app.
+//
+// Design notes:
+//  - One data channel per connection, negotiated symmetrically on both
+//    sides (`negotiated: true, id: 0`) so no `ondatachannel` is needed.
+//  - All reliability concerns (ACKs, retry with exponential backoff,
+//    dedup of incoming messages) are handled by `ReliableMessenger`.
+//    Consumers register listeners via `onMessage`/`onChannelStateChange`/
+//    `onConnectionStateChange` instead of assigning `channel.onmessage`
+//    (which is a single-slot and would clobber the library handlers).
+//  - Signaling is polled via relative URLs; the creator can trigger an
+//    ICE restart by publishing a new offer and the participant watches
+//    for offer changes and re-negotiates automatically.
+// =====================================================================
 
-interface QueuedMessage {
-  id: string;
-  data: string;
-  attempts: number;
-  maxAttempts: number;
-  timestamp: number;
-}
+// ---------- Configuration ----------
 
-class MessageQueue {
-  private queue: Map<string, QueuedMessage> = new Map();
-  private channel: RTCDataChannel;
-  private pendingMessages: Set<string> = new Set();
-  private retryInterval: ReturnType<typeof setInterval> | null = null;
-  private maxRetryInterval = 5000; // Max 5 seconds between retries
-  private acknowledgedMessages: Set<string> = new Set();
-  private messageIdToQueueId: Map<string, string> = new Map();
-  private submittedAnswers: Set<string> = new Set(); // Track submitted answers by quizId
-  private completedQuizzes: Set<string> = new Set(); // NEW: Track fully completed quizzes
-  
-  constructor(channel: RTCDataChannel) {
-    this.channel = channel;
-    this.startRetryTimer();
-  }
-  
-  // Enqueue a message for sending
-  enqueue(data: string, maxAttempts = 5): string {
-    try {
-      const parsedData = JSON.parse(data);
-      
-      // Special handling for answer messages to prevent duplicates
-      if (parsedData.type === 'answer') {
-        const answerData = JSON.parse(parsedData.payload);
-        const quizId = answerData.quizId;
-        
-        // If this quiz is marked as completed, don't send any more messages for it
-        if (this.completedQuizzes.has(quizId)) {
-          console.log(`[MessageQueue] Quiz ${quizId} is completed, ignoring new messages`);
-          return '';
-        }
-        
-        // If we've already submitted an answer for this quiz, don't submit again
-        if (this.submittedAnswers.has(quizId)) {
-          console.log(`[MessageQueue] Answer already submitted for quiz ${quizId}, ignoring duplicate`);
-          return '';
-        }
-        
-        // Remove any existing answer messages for this quiz from the queue
-        for (const [msgId, msg] of this.queue.entries()) {
-          try {
-            const existingData = JSON.parse(msg.data);
-            if (existingData.type === 'answer') {
-              const existingAnswer = JSON.parse(existingData.payload);
-              if (existingAnswer.quizId === quizId) {
-                console.log(`[MessageQueue] Removing old answer message for quiz ${quizId}`);
-                this.queue.delete(msgId);
-                this.pendingMessages.delete(msgId);
-              }
-            }
-          } catch (err) {
-            // Skip if we can't parse the message
-          }
-        }
-        
-        // Mark this quiz as having a submitted answer
-        this.submittedAnswers.add(quizId);
-      }
-    } catch (err) {
-      // Not JSON or couldn't parse, continue with normal processing
-    }
-    
-    const id = Math.random().toString(36).substring(2);
-    
-    // Parse the message to extract original ID if it exists
-    try {
-      const parsedData = JSON.parse(data);
-      if (parsedData.messageId) {
-        // Store the mapping from messageId to queue id
-        this.messageIdToQueueId.set(parsedData.messageId, id);
-        
-        // Check if this message was already acknowledged
-        if (this.acknowledgedMessages.has(parsedData.messageId)) {
-          console.log(`[MessageQueue] Message ${parsedData.messageId} was already acknowledged, not resending`);
-          return parsedData.messageId;
-        }
-      }
-    } catch (err) {
-      // Not JSON or couldn't parse, continue with normal processing
-    }
-    
-    const message: QueuedMessage = {
-      id,
-      data,
-      attempts: 0,
-      maxAttempts,
-      timestamp: Date.now()
-    };
-    
-    this.queue.set(id, message);
-    this.trySend(id);
-    return id;
-  }
-  
-  // Try to send a specific message
-  private trySend(id: string): boolean {
-    // Check if message is already acknowledged
-    if (this.acknowledgedMessages.has(id)) {
-      // Remove silently
-      this.queue.delete(id);
-      return true;
-    }
-    
-    // Check if channel is open
-    if (this.channel.readyState !== 'open') {
-      return false;
-    }
-    
-    // Check if message is in queue
-    const message = this.queue.get(id);
-    if (!message) return false;
-    
-    // Check if message is already pending acknowledgment
-    if (this.pendingMessages.has(id)) {
-      return false;
-    }
-    
-    try {
-      const parsedData = JSON.parse(message.data);
-      if (parsedData.type === 'answer') {
-        const answerData = JSON.parse(parsedData.payload);
-        const quizId = answerData.quizId;
-        
-        // If this quiz is completed, remove the message and don't send
-        if (this.completedQuizzes.has(quizId)) {
-          this.queue.delete(id);
-          return false;
-        }
-        
-        // If this answer has been attempted more than once, don't retry
-        if (message.attempts > 0) {
-          console.log(`[MessageQueue] Answer for quiz ${quizId} already attempted, removing from queue`);
-          this.queue.delete(id);
-          return false;
-        }
-      }
-    } catch (err) {
-      // Not JSON or couldn't parse, continue with normal processing
-    }
-    
-    // Only attempt to send if we haven't reached max attempts
-    if (message.attempts >= message.maxAttempts) {
-      console.log(`[MessageQueue] Max attempts (${message.maxAttempts}) reached for message ${id}, dropping`);
-      this.queue.delete(id);
-      return false;
-    }
-    
-    try {
-      // Increment attempts before sending to prevent rapid retry on error
-      message.attempts++;
-      
-      // Set as pending before sending
-      this.pendingMessages.add(id);
-      
-      // Parse message to see what's being sent (for debugging)
-      try {
-        const parsedMessage = JSON.parse(message.data);
-        // Only log non-ACK messages being sent
-        if (parsedMessage.type !== 'ack') {
-          if (message.attempts === 1) {
-            console.log(`[MessageQueue] Sending ${parsedMessage.type} message`);
-          } else {
-            console.log(`[MessageQueue] Retrying ${parsedMessage.type} message, attempt ${message.attempts}/${message.maxAttempts}`);
-          }
-        }
-        
-        // Special case for ACK messages - don't wait for acknowledgment
-        if (parsedMessage.type === 'ack') {
-          // Remove from queue immediately since ACKs don't need acknowledgment themselves
-          this.pendingMessages.delete(id);
-          this.queue.delete(id);
-        }
-      } catch (err) {
-        // If parsing fails, just send without logging
-      }
-      
-      // Send the message
-      this.channel.send(message.data);
-      
-      // Different timeout durations for different message types
-      let timeoutDuration = 3000; // Default 3 seconds
-      try {
-        const parsedData = JSON.parse(message.data);
-        if (parsedData.type === 'answer') {
-          timeoutDuration = 1000; // Shorter timeout for answers (1 second)
-        } else if (parsedData.type === 'ack') {
-          timeoutDuration = 500; // Very short timeout for ACKs (0.5 seconds)
-        }
-      } catch (err) {
-        // Use default timeout if parsing fails
-      }
-      
-      // Set timeout to consider message as failed if no ACK received
-      setTimeout(() => {
-        if (this.pendingMessages.has(id) && !this.acknowledgedMessages.has(id)) {
-          // Only log timeout for non-ACK messages
-          try {
-            const parsedData = JSON.parse(message.data);
-            if (parsedData.type !== 'ack') {
-              console.log(`[MessageQueue] Message ${parsedData.type} timed out, will retry`);
-            }
-          } catch (err) {
-            // If we can't parse, assume it's not an ACK and log
-            console.log(`[MessageQueue] Message timed out, will retry`);
-          }
-          
-          this.pendingMessages.delete(id);
-          
-          try {
-            const parsedData = JSON.parse(message.data);
-            if (parsedData.type === 'answer') {
-              const answerData = JSON.parse(parsedData.payload);
-              const quizId = answerData.quizId;
-              
-              // Mark quiz as completed even if we don't get ACK
-              this.completedQuizzes.add(quizId);
-              console.log(`[MessageQueue] Marking quiz ${quizId} as completed after timeout`);
-              this.queue.delete(id);
-            }
-          } catch (err) {
-            // Not JSON or couldn't parse, continue with normal processing
-          }
-        }
-      }, timeoutDuration);
-      
-      return true;
-    } catch (err) {
-      console.error(`[MessageQueue] Error sending message:`, err);
-      this.pendingMessages.delete(id);
-      return false;
-    }
-  }
-  
-  // Mark a message as successfully delivered (called when ACK received)
-  acknowledge(id: string): void {
-    // Check if this is a messageId (from the message) rather than a queue ID
-    const queueId = this.messageIdToQueueId.get(id) || id;
-    
-    // Get the message data to check if it's an answer
-    const message = this.queue.get(queueId);
-    if (message) {
-      try {
-        const parsedData = JSON.parse(message.data);
-        if (parsedData.type === 'answer') {
-          const answerData = JSON.parse(parsedData.payload);
-          const quizId = answerData.quizId;
-          console.log(`[MessageQueue] Acknowledged answer for quiz ${quizId}`);
-          
-          // Mark the quiz as completed when we get acknowledgment
-          this.completedQuizzes.add(quizId);
-          
-          // Remove all pending messages for this quiz
-          for (const [msgId, msg] of this.queue.entries()) {
-            try {
-              const data = JSON.parse(msg.data);
-              if (data.type === 'answer') {
-                const payload = JSON.parse(data.payload);
-                if (payload.quizId === quizId) {
-                  console.log(`[MessageQueue] Removing redundant message for completed quiz ${quizId}`);
-                  this.queue.delete(msgId);
-                  this.pendingMessages.delete(msgId);
-                }
-              }
-            } catch (err) {
-              // Skip if we can't parse the message
-            }
-          }
-        }
-      } catch (err) {
-        // Not JSON or couldn't parse, continue with normal processing
-      }
-    }
-    
-    // Remove from pending and queue
-    this.pendingMessages.delete(queueId);
-    this.queue.delete(queueId);
-    
-    // Add both IDs to acknowledged set
-    this.acknowledgedMessages.add(id);
-    this.acknowledgedMessages.add(queueId);
-    
-    // Clean up old acknowledgments if we have too many
-    if (this.acknowledgedMessages.size > 100) {
-      const toRemove = Array.from(this.acknowledgedMessages).slice(0, 50);
-      toRemove.forEach(msgId => this.acknowledgedMessages.delete(msgId));
-    }
-  }
-  
-  // Start the retry timer
-  private startRetryTimer(): void {
-    if (this.retryInterval) clearInterval(this.retryInterval);
-    
-    this.retryInterval = setInterval(() => {
-      // Only process if we have items and channel is open
-      if (this.queue.size > 0 && this.channel.readyState === 'open') {
-        // Count non-ACK messages in queue
-        let nonAckCount = 0;
-        let hasAnswerMessages = false;
-        
-        for (const [_, message] of this.queue.entries()) {
-          try {
-            const parsedData = JSON.parse(message.data);
-            if (parsedData.type !== 'ack') {
-              nonAckCount++;
-              if (parsedData.type === 'answer') {
-                hasAnswerMessages = true;
-              }
-            }
-          } catch (err) {
-            nonAckCount++; // If we can't parse, count it
-          }
-        }
-        
-        // Only log if there are answer messages in the queue
-        if (hasAnswerMessages) {
-          console.log(`[MessageQueue] Retry timer: processing ${nonAckCount} messages, including answers`);
-        }
-        
-        // Process messages
-        for (const [id, message] of this.queue.entries()) {
-          // Skip messages that are pending ACK
-          if (this.pendingMessages.has(id)) continue;
-          
-          // Skip messages that have been acknowledged
-          if (this.acknowledgedMessages.has(id)) {
-            this.queue.delete(id);
-            continue;
-          }
-          
-          // If we've reached max attempts, remove from queue
-          if (message.attempts >= message.maxAttempts) {
-            try {
-              const parsedData = JSON.parse(message.data);
-              if (parsedData.type !== 'ack') {
-                console.log(`[MessageQueue] Max attempts reached for ${parsedData.type} message, dropping`);
-              }
-            } catch (err) {
-              // If we can't parse, just log generic message
-              console.log(`[MessageQueue] Max attempts reached for message, dropping`);
-            }
-            this.queue.delete(id);
-            continue;
-          }
-          
-          // Otherwise try to send
-          this.trySend(id);
-        }
-      }
-    }, 1000); // Check every second
-  }
-  
-  // Stop the retry timer (when shutting down)
-  stop(): void {
-    if (this.retryInterval) {
-      clearInterval(this.retryInterval);
-      this.retryInterval = null;
-    }
-  }
-}
-
-// Update the ICE server configuration for both creator and participant
-const getICEConfiguration = (): RTCConfiguration => ({
+const ICE_CONFIGURATION: RTCConfiguration = {
   iceServers: [
-    // STUN servers
-    { 
-      urls: [
-        "stun:stun.l.google.com:19302",
-        "stun:stun1.l.google.com:19302",
-        "stun:stun2.l.google.com:19302",
-        "stun:stun3.l.google.com:19302",
-        "stun:stun4.l.google.com:19302"
-      ]
-    },
-    // Primary TURN servers
     {
       urls: [
-        "turn:us-turn1.3cx.com:443?transport=tcp",
-        "turn:us-turn2.3cx.com:80?transport=tcp"
+        'stun:stun.l.google.com:19302',
+        'stun:stun1.l.google.com:19302',
+        'stun:stun2.l.google.com:19302',
       ],
-      username: "test",
-      credential: "test"
     },
-    // Backup TURN servers
     {
       urls: [
-        "turn:us-turn4.3cx.com:443?transport=tcp",
-        "turn:us-turn3.3cx.com:80?transport=tcp"
+        'turn:us-turn1.3cx.com:443?transport=tcp',
+        'turn:us-turn2.3cx.com:80?transport=tcp',
       ],
-      username: "test",
-      credential: "test"
-    }
+      username: 'test',
+      credential: 'test',
+    },
   ],
   iceTransportPolicy: 'all',
-  iceCandidatePoolSize: 10,
-  bundlePolicy: 'max-bundle' as RTCBundlePolicy,
-  rtcpMuxPolicy: 'require' as RTCRtcpMuxPolicy
-});
+  iceCandidatePoolSize: 4,
+  bundlePolicy: 'max-bundle',
+  rtcpMuxPolicy: 'require',
+};
 
-export async function createConnection() {
-    const creatorPeer = new RTCPeerConnection(getICEConfiguration());
-    console.log("[Creator] Creating RTCPeerConnection");
-  
-    // Create data channel with more reliable settings
-    const dataChannel = creatorPeer.createDataChannel("quizChannel", {
-      ordered: true,
-      maxRetransmits: 10,
-      protocol: 'quiz',
-      negotiated: true,
-      id: 0
-    });
-  
-    console.log("[Creator] Data channel created with ID:", dataChannel.id);
-  
-    // Set up all event handlers with better error handling
-    dataChannel.onopen = () => {
-      console.log("[Creator] Data Channel opened");
-      // Reset any error state when connection is successful
-      if (typeof window !== 'undefined') {
-        const errorElement = document.querySelector('.error-message') as HTMLElement;
-        if (errorElement) errorElement.style.display = 'none';
-      }
-    };
-  
-    dataChannel.onerror = (event) => {
-      console.error("[Creator] Data Channel error:", event);
-      if (dataChannel.readyState === 'closed') {
-        // Try to reestablish the data channel
-        try {
-          const newDataChannel = creatorPeer.createDataChannel("quizChannel", {
-            ordered: true,
-            maxRetransmits: 10,
-            protocol: 'quiz'
-          });
-          Object.assign(dataChannel, newDataChannel);
-        } catch (err) {
-          console.error("[Creator] Failed to recreate data channel:", err);
-        }
-      }
-    };
-  
-    dataChannel.onclose = () => {
-      console.log("[Creator] Data Channel closed");
-      // Attempt to reopen if closed unexpectedly
-      if (creatorPeer.connectionState === 'connected') {
-        console.log("[Creator] Attempting to reopen data channel");
-        try {
-          const newDataChannel = creatorPeer.createDataChannel("quizChannel", {
-            ordered: true,
-            maxRetransmits: 10,
-            protocol: 'quiz'
-          });
-          Object.assign(dataChannel, newDataChannel);
-        } catch (err) {
-          console.error("[Creator] Failed to reopen data channel:", err);
-        }
-      }
-    };
-  
-    // Create persistent sets to track processed message IDs
-    const processedMessageIds = new Set<string>();
-    const messageQueues = new Map<string, MessageQueue>();
+const DATA_CHANNEL_INIT: RTCDataChannelInit = {
+  ordered: true,
+  negotiated: true,
+  id: 0,
+  protocol: 'quiz',
+};
 
-    // Create offer first
-    console.log("[Creator] Creating offer");
-    const offerOptions: RTCOfferOptions = {
-      offerToReceiveAudio: false,
-      offerToReceiveVideo: false,
-      iceRestart: false
+const SIGNAL_ENDPOINT = '/api/signal';
+
+// Reliability / polling tuning
+const ACK_INITIAL_TIMEOUT_MS = 1500;
+const ACK_MAX_TIMEOUT_MS = 8000;
+const DEFAULT_MAX_ATTEMPTS = 6;
+const DEDUP_TTL_MS = 5 * 60 * 1000;
+const SIGNAL_POLL_ACTIVE_MS = 1500;
+const SIGNAL_POLL_IDLE_MS = 5000;
+const RECOVERY_DEBOUNCE_MS = 2000;
+
+// ---------- Public types ----------
+
+export type P2PMessage = { [key: string]: unknown };
+export type MessageHandler = (data: P2PMessage) => void;
+export type ChannelStateHandler = (state: RTCDataChannelState) => void;
+export type ConnectionStateHandler = (state: RTCPeerConnectionState) => void;
+export type Unsubscribe = () => void;
+
+export interface P2PConnection {
+  peer: RTCPeerConnection;
+  sessionId: string;
+  /** Send a message with delivery guarantees (retried until ACK or max attempts). Returns the messageId. */
+  sendReliable: (data: P2PMessage) => string | null;
+  /** Fire-and-forget send. Returns true if the message was handed to the channel. */
+  sendUnreliable: (data: P2PMessage) => boolean;
+  onMessage: (handler: MessageHandler) => Unsubscribe;
+  onChannelStateChange: (handler: ChannelStateHandler) => Unsubscribe;
+  onConnectionStateChange: (handler: ConnectionStateHandler) => Unsubscribe;
+  getChannelState: () => RTCDataChannelState;
+  getConnectionState: () => RTCPeerConnectionState;
+  /** Tear everything down: stop polling, close queue, close channel and peer. */
+  close: () => void;
+}
+
+// ---------- Utilities ----------
+
+function generateId(): string {
+  const buf = new Uint8Array(16);
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    crypto.getRandomValues(buf);
+  } else {
+    for (let i = 0; i < buf.length; i++) buf[i] = Math.floor(Math.random() * 256);
+  }
+  return Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function iceKey(ice: RTCIceCandidateInit): string {
+  // Stable string representation for dedup across polls.
+  return JSON.stringify({
+    c: ice.candidate,
+    m: ice.sdpMid,
+    i: ice.sdpMLineIndex,
+    u: ice.usernameFragment,
+  });
+}
+
+async function postJson(body: unknown): Promise<Response> {
+  return fetch(SIGNAL_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+async function putJson(body: unknown): Promise<Response> {
+  return fetch(SIGNAL_ENDPOINT, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+// ---------- Reliable messenger ----------
+
+interface PendingMessage {
+  messageId: string;
+  serialized: string;
+  attempts: number;
+  maxAttempts: number;
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
+class ReliableMessenger {
+  private readonly channel: RTCDataChannel;
+  private readonly logPrefix: string;
+  private readonly pending = new Map<string, PendingMessage>();
+  private readonly seenIncoming = new Map<string, number>();
+  private readonly seenAcked = new Map<string, number>();
+  private readonly messageHandlers = new Set<MessageHandler>();
+  private cleanupInterval: ReturnType<typeof setInterval> | null = null;
+  private closed = false;
+
+  constructor(channel: RTCDataChannel, logPrefix: string) {
+    this.channel = channel;
+    this.logPrefix = logPrefix;
+
+    // addEventListener (not onmessage=) so app-level listeners can coexist.
+    this.channel.addEventListener('message', this.handleIncoming);
+    this.channel.addEventListener('open', this.flushPending);
+
+    this.cleanupInterval = setInterval(this.pruneDedupMaps, DEDUP_TTL_MS);
+  }
+
+  addMessageHandler(handler: MessageHandler): Unsubscribe {
+    this.messageHandlers.add(handler);
+    return () => {
+      this.messageHandlers.delete(handler);
     };
-  
-    const offer = await creatorPeer.createOffer(offerOptions);
-    await creatorPeer.setLocalDescription(offer);
-    console.log("[Creator] Local description set");
-  
-    // Create session on signaling server with the offer
-    console.log("[Creator] Sending offer to signaling server");
-    
-    // Use the current origin for API calls on the creator side
-    const response = await fetch('/api/signal', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ 
-        offer: creatorPeer.localDescription 
-      })
-    });
-  
-    if (!response.ok) {
-      throw new Error('Failed to create session on signaling server');
+  }
+
+  sendReliable(data: P2PMessage, maxAttempts = DEFAULT_MAX_ATTEMPTS): string | null {
+    if (this.closed) return null;
+
+    const existingId = typeof data.messageId === 'string' ? data.messageId : '';
+    const messageId = existingId.length > 0 ? existingId : generateId();
+
+    if (this.seenAcked.has(messageId)) return messageId; // already delivered
+    if (this.pending.has(messageId)) return messageId; // already enqueued
+
+    const enveloped: P2PMessage = { ...data, messageId };
+    const serialized = JSON.stringify(enveloped);
+
+    const message: PendingMessage = {
+      messageId,
+      serialized,
+      attempts: 0,
+      maxAttempts,
+      timer: null,
+    };
+
+    this.pending.set(messageId, message);
+    this.trySend(message);
+    return messageId;
+  }
+
+  sendUnreliable(data: P2PMessage): boolean {
+    if (this.closed || this.channel.readyState !== 'open') return false;
+    try {
+      this.channel.send(JSON.stringify(data));
+      return true;
+    } catch (err) {
+      console.error(`${this.logPrefix}[ReliableMessenger] send failed:`, err);
+      return false;
     }
-  
-    const { sessionId } = await response.json();
-    console.log("[Creator] Session created with ID:", sessionId);
+  }
 
-    // Initialize message queue after we have the sessionId
-    const messageQueue = new MessageQueue(dataChannel);
-    messageQueues.set(sessionId, messageQueue);
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.channel.removeEventListener('message', this.handleIncoming);
+    this.channel.removeEventListener('open', this.flushPending);
+    for (const msg of this.pending.values()) {
+      if (msg.timer) clearTimeout(msg.timer);
+    }
+    this.pending.clear();
+    this.messageHandlers.clear();
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
+  }
 
-    dataChannel.onmessage = (event) => {
+  // ----- internals -----
+
+  private pruneDedupMaps = () => {
+    const now = Date.now();
+    for (const [id, ts] of this.seenIncoming) {
+      if (now - ts > DEDUP_TTL_MS) this.seenIncoming.delete(id);
+    }
+    for (const [id, ts] of this.seenAcked) {
+      if (now - ts > DEDUP_TTL_MS) this.seenAcked.delete(id);
+    }
+  };
+
+  private flushPending = () => {
+    if (this.closed) return;
+    for (const msg of this.pending.values()) {
+      if (msg.timer === null) this.trySend(msg);
+    }
+  };
+
+  private handleIncoming = (event: MessageEvent) => {
+    if (this.closed) return;
+
+    let parsedUnknown: unknown;
+    try {
+      parsedUnknown = JSON.parse(event.data);
+    } catch {
+      return; // malformed / not our format
+    }
+    if (!parsedUnknown || typeof parsedUnknown !== 'object' || Array.isArray(parsedUnknown)) {
+      return;
+    }
+    const parsed = parsedUnknown as P2PMessage;
+
+    // ACK handling: mark pending outgoing as delivered.
+    if (parsed.type === 'ack' && typeof parsed.messageId === 'string') {
+      this.handleAck(parsed.messageId);
+      return;
+    }
+
+    // Any message that carries a `messageId` was sent through `sendReliable`
+    // on the peer; acknowledge it every time we see it (so retries by the
+    // peer due to lost ACKs resolve) and deduplicate delivery to handlers.
+    const mid = parsed.messageId;
+    if (typeof mid === 'string' && mid.length > 0) {
+      this.sendAck(mid);
+      if (this.seenIncoming.has(mid)) return;
+      this.seenIncoming.set(mid, Date.now());
+    }
+
+    for (const h of this.messageHandlers) {
       try {
-        const data = JSON.parse(event.data);
-        
-        // Handle ACK messages silently
-        if (data.type === 'ack' && data.messageId) {
-          const messageQueue = messageQueues.get(sessionId);
-          if (messageQueue) {
-            messageQueue.acknowledge(data.messageId);
-          }
-          return; // Don't process ACKs further
-        }
-        
-        // For non-ACK messages that have a messageId, send ACK only if not processed before
-        if (data.messageId && !processedMessageIds.has(data.messageId)) {
-          processedMessageIds.add(data.messageId);
-          
-          // Only send ACK for messages that require reliability
-          if (data.type === 'quiz' || data.type === 'answer') {
-            if (dataChannel.readyState === 'open') {
-              const ack = JSON.stringify({
-                type: 'ack',
-                messageId: data.messageId,
-                timestamp: Date.now()
-              });
-              dataChannel.send(ack);
-            }
-          }
-        }
+        h(parsed);
       } catch (err) {
-        console.error('[Creator] Error processing message:', err);
+        console.error(`${this.logPrefix}[ReliableMessenger] handler threw:`, err);
       }
-    };
-  
-    // Set up ICE candidate handling after we have the sessionId
-    creatorPeer.onicecandidate = async (event) => {
-      if (event.candidate) {
-        console.log("[Creator] New ICE candidate");
-        try {
-          const response = await fetch('/api/signal', {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              sessionId: sessionId,
-              ice: event.candidate.toJSON(),
-              role: 'creator'
-            })
-          });
-          if (!response.ok) {
-            console.error("[Creator] Failed to send ICE candidate");
-          }
-        } catch (err) {
-          console.error("[Creator] Error sending ICE candidate:", err);
-        }
-      } else {
-        console.log("[Creator] ICE gathering complete");
-      }
-    };
-  
-    // Enhanced connection state monitoring
-    let connectionMonitorInterval: NodeJS.Timeout | null = null;
-    let lastStateChange = Date.now();
-    const MAX_STATE_DURATION = 10000; // 10 seconds
+    }
+  };
 
-    const monitorConnection = () => {
-      if (connectionMonitorInterval) clearInterval(connectionMonitorInterval);
-      
-      connectionMonitorInterval = setInterval(() => {
-        const currentTime = Date.now();
-        const stateDuration = currentTime - lastStateChange;
+  private sendAck(messageId: string) {
+    if (this.channel.readyState !== 'open') return;
+    try {
+      this.channel.send(JSON.stringify({ type: 'ack', messageId }));
+    } catch (err) {
+      console.error(`${this.logPrefix}[ReliableMessenger] failed to send ack:`, err);
+    }
+  }
 
-        if (creatorPeer.connectionState === 'disconnected' && stateDuration > MAX_STATE_DURATION) {
-          console.log("[Creator] Connection stuck in disconnected state, attempting recovery");
-          handleConnectionRecovery();
-        }
-      }, 2000);
-    };
+  private handleAck(messageId: string) {
+    const msg = this.pending.get(messageId);
+    if (!msg) return;
+    if (msg.timer) clearTimeout(msg.timer);
+    this.pending.delete(messageId);
+    this.seenAcked.set(messageId, Date.now());
+  }
 
-    const handleConnectionRecovery = async () => {
-      console.log("[Creator] Starting connection recovery process");
-      
-      if (creatorPeer.connectionState === 'failed' || creatorPeer.connectionState === 'disconnected') {
-        try {
-          // First try ICE restart
-          const offer = await creatorPeer.createOffer({ iceRestart: true });
-          await creatorPeer.setLocalDescription(offer);
-          
-          // Send the new offer to signaling server
-          const response = await fetch('/api/signal', {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-              sessionId,
-              offer: creatorPeer.localDescription,
-              role: 'creator',
-              recovery: true
-            })
-          });
-          
-          if (!response.ok) {
-            throw new Error('Failed to send recovery offer');
-          }
-          
-          console.log("[Creator] Recovery offer sent successfully");
-          lastStateChange = Date.now(); // Reset the timer
-        } catch (err) {
-          console.error("[Creator] Recovery attempt failed:", err);
-        }
-      }
-    };
+  private trySend(message: PendingMessage) {
+    if (this.closed) return;
+    if (!this.pending.has(message.messageId)) return;
 
-    // Update connection state handler
-    creatorPeer.onconnectionstatechange = () => {
-      const state = creatorPeer.connectionState;
-      console.log("[Creator] Connection state:", state);
-      lastStateChange = Date.now();
-
-      if (state === 'connected') {
-        console.log("[Creator] Connection established successfully");
-      } else if (state === 'disconnected') {
-        console.log("[Creator] Connection disconnected, monitoring for recovery");
-        monitorConnection();
-      } else if (state === 'failed') {
-        console.log("[Creator] Connection failed, attempting immediate recovery");
-        handleConnectionRecovery();
-      }
-    };
-
-    // Return object with additional methods for reliable messaging
-    return { 
-      creatorPeer, 
-      dataChannel, 
-      sessionId,
-      sendReliableMessage: (data: any) => {
-        const type = data.type || 'unknown';
-        console.log(`[Creator] Preparing to send message of type: ${type}`);
-        
-        // Only use reliable messaging for answers and quizzes
-        const needsReliability = type === 'answer' || type === 'quiz';
-        
-        if (!needsReliability) {
-          // Send directly without queuing or message ID for heartbeats, acks, etc.
-          if (dataChannel.readyState === 'open') {
-            const messageString = JSON.stringify(data);
-            dataChannel.send(messageString);
-            return null;
-          }
-          return null;
-        }
-        
-        // For messages needing reliability (answers and quizzes)
-        let messageId = data.messageId;
-        if (!messageId) {
-          messageId = Math.random().toString(36).substring(2);
-        }
-        
-        const message = {
-          ...data,
-          messageId
-        };
-        
-        console.log(`[Creator] Sending reliable message with ID: ${messageId}, type: ${type}`);
-        const messageString = JSON.stringify(message);
-        return messageQueue.enqueue(messageString);
-      }
-    };
-}
-  
-export async function setParticipantAnswer(
-  creatorPeer: RTCPeerConnection,
-  answer: RTCSessionDescriptionInit
-) {
-  await creatorPeer.setRemoteDescription(answer);
-}
-  
-export function addParticipantIceCandidate(
-  creatorPeer: RTCPeerConnection,
-  candidate: RTCIceCandidate
-) {
-  creatorPeer.addIceCandidate(candidate);
-}
-  
-export async function joinConnection(sessionId: string, participantId: string) {
-    // Create persistent set to track processed message IDs at the connection level
-    const processedMessageIds = new Set<string>();
-    
-    console.log("[Participant] Joining session:", sessionId);
-    
-    const participantPeer = new RTCPeerConnection(getICEConfiguration());
-    
-    // Enhanced connection monitoring for participant
-    let connectionMonitorInterval: NodeJS.Timeout | null = null;
-    let lastStateChange = Date.now();
-    const MAX_STATE_DURATION = 10000; // 10 seconds
-
-    // Get the host address dynamically
-    const hostAddress = await getHostAddress();
-    
-    // Get session info from signaling server
-    const response = await fetch(`http://${hostAddress}/api/signal?session=${sessionId}&participant=${participantId}`);
-    if (!response.ok) {
-      throw new Error('Failed to get session info');
+    if (message.attempts >= message.maxAttempts) {
+      console.warn(
+        `${this.logPrefix}[ReliableMessenger] dropping message after ${message.attempts} attempts`,
+        message.messageId
+      );
+      this.pending.delete(message.messageId);
+      return;
     }
 
-    const session = await response.json();
-    
-    if (!session.offer) {
-      throw new Error('No offer found for this session');
+    if (this.channel.readyState !== 'open') {
+      // Don't burn attempts while disconnected; we'll retry on 'open'.
+      return;
     }
 
-    console.log("[Participant] Got session info with offer");
+    message.attempts += 1;
+    try {
+      this.channel.send(message.serialized);
+    } catch (err) {
+      console.error(`${this.logPrefix}[ReliableMessenger] send threw:`, err);
+    }
 
-    let receiveChannel: RTCDataChannel | null = null;
-    let messageQueue: MessageQueue | null = null;
+    const backoff = Math.min(
+      ACK_INITIAL_TIMEOUT_MS * Math.pow(2, message.attempts - 1),
+      ACK_MAX_TIMEOUT_MS
+    );
+    message.timer = setTimeout(() => {
+      message.timer = null;
+      if (this.pending.has(message.messageId)) this.trySend(message);
+    }, backoff);
+  }
+}
 
-    // Create a more robust promise for data channel establishment
-    const channelPromise = new Promise<RTCDataChannel>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error('Data channel establishment timeout'));
-      }, 30000);
+// ---------- Signaling polling ----------
 
+interface SessionInfo {
+  offer?: RTCSessionDescriptionInit;
+  creatorIce?: RTCIceCandidateInit[];
+  participants?: Record<
+    string,
+    {
+      answer?: RTCSessionDescriptionInit;
+      participantIce?: RTCIceCandidateInit[];
+      lastSeen?: number;
+    }
+  >;
+}
+
+async function fetchSession(sessionId: string, participantId?: string): Promise<SessionInfo> {
+  const url = new URL(SIGNAL_ENDPOINT, window.location.origin);
+  url.searchParams.set('session', sessionId);
+  if (participantId) url.searchParams.set('participant', participantId);
+  const resp = await fetch(url.toString());
+  if (!resp.ok) throw new Error(`Signaling GET failed: ${resp.status} ${resp.statusText}`);
+  return resp.json();
+}
+
+/** Schedules a polling loop with self-adjusting interval. Returns a cancel function. */
+function startPollingLoop(poll: () => Promise<void>, getInterval: () => number): () => void {
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const schedule = (delay: number) => {
+    if (stopped) return;
+    timer = setTimeout(run, delay);
+  };
+  const run = async () => {
+    timer = null;
+    if (stopped) return;
+    try {
+      await poll();
+    } catch (err) {
+      console.warn('[poll] error:', err);
+    } finally {
+      schedule(getInterval());
+    }
+  };
+
+  schedule(0);
+  return () => {
+    stopped = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+}
+
+// ---------- Creator ----------
+
+export async function createConnection(): Promise<P2PConnection> {
+  const peer = new RTCPeerConnection(ICE_CONFIGURATION);
+  console.log('[Creator] Creating RTCPeerConnection');
+
+  const channel = peer.createDataChannel('quizChannel', DATA_CHANNEL_INIT);
+  console.log('[Creator] Data channel created with id', channel.id);
+
+  const messenger = new ReliableMessenger(channel, '[Creator]');
+  const channelHandlers = new Set<ChannelStateHandler>();
+  const connHandlers = new Set<ConnectionStateHandler>();
+
+  const notifyChannel = () => channelHandlers.forEach((h) => h(channel.readyState));
+  const notifyConn = () => connHandlers.forEach((h) => h(peer.connectionState));
+
+  channel.addEventListener('open', notifyChannel);
+  channel.addEventListener('close', notifyChannel);
+  channel.addEventListener('error', notifyChannel);
+  peer.addEventListener('connectionstatechange', notifyConn);
+
+  // Buffer ICE candidates that arrive before the session is registered.
+  const earlyIce: RTCIceCandidateInit[] = [];
+  let sessionId: string | null = null;
+  const sendIce = async (ice: RTCIceCandidateInit) => {
+    try {
+      const r = await putJson({ sessionId, role: 'creator', ice });
+      if (!r.ok) console.error('[Creator] ICE PUT rejected:', r.status);
+    } catch (err) {
+      console.error('[Creator] Failed to send ICE:', err);
+    }
+  };
+  peer.onicecandidate = (event) => {
+    if (!event.candidate) {
+      console.log('[Creator] ICE gathering complete');
+      return;
+    }
+    const ice = event.candidate.toJSON();
+    if (!sessionId) {
+      earlyIce.push(ice);
+    } else {
+      void sendIce(ice);
+    }
+  };
+
+  // Offer and registration.
+  const offer = await peer.createOffer();
+  await peer.setLocalDescription(offer);
+
+  const resp = await postJson({ offer: peer.localDescription });
+  if (!resp.ok) {
+    peer.close();
+    throw new Error(`Failed to create session: ${resp.status} ${resp.statusText}`);
+  }
+  const body = (await resp.json()) as { sessionId: string };
+  sessionId = body.sessionId;
+  console.log('[Creator] Session created:', sessionId);
+
+  // Flush any ICE that was buffered before sessionId was known.
+  for (const ice of earlyIce.splice(0)) void sendIce(ice);
+
+  // ICE restart recovery on transport failure.
+  let recoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  let recoveryInFlight = false;
+  const attemptRecovery = async () => {
+    if (recoveryInFlight) return;
+    const state = peer.connectionState;
+    if (state !== 'failed' && state !== 'disconnected') return;
+    recoveryInFlight = true;
+    try {
+      console.log('[Creator] Attempting ICE restart');
+      const newOffer = await peer.createOffer({ iceRestart: true });
+      await peer.setLocalDescription(newOffer);
+      const r = await putJson({
+        sessionId,
+        role: 'creator',
+        offer: peer.localDescription,
+      });
+      if (!r.ok) console.error('[Creator] Recovery PUT failed:', r.status);
+    } catch (err) {
+      console.error('[Creator] ICE restart failed:', err);
+    } finally {
+      recoveryInFlight = false;
+    }
+  };
+  peer.addEventListener('connectionstatechange', () => {
+    const state = peer.connectionState;
+    console.log('[Creator] connection state:', state);
+    if (state === 'failed' || state === 'disconnected') {
+      if (recoveryTimer) clearTimeout(recoveryTimer);
+      recoveryTimer = setTimeout(attemptRecovery, RECOVERY_DEBOUNCE_MS);
+    } else if (state === 'connected') {
+      if (recoveryTimer) {
+        clearTimeout(recoveryTimer);
+        recoveryTimer = null;
+      }
+    }
+  });
+
+  // Polling: pick up participant answers and their ICE candidates.
+  const appliedAnswers = new Map<string, string>(); // participantId -> sdp
+  const seenIce = new Set<string>();
+  const pendingIce: RTCIceCandidateInit[] = [];
+
+  const flushPendingIce = async () => {
+    while (pendingIce.length > 0) {
+      const ice = pendingIce.shift()!;
       try {
-        // First set the remote description before creating data channel
-        console.log("[Participant] Setting remote description");
-        participantPeer.setRemoteDescription(session.offer)
-          .then(() => {
-            console.log("[Participant] Remote description set successfully");
-            
-            // After setting remote description, create the data channel
-            try {
-              // Create the data channel with the same ID as the creator
-              const channel = participantPeer.createDataChannel("quizChannel", {
-                ordered: true,
-                maxRetransmits: 10,
-                protocol: 'quiz',
-                negotiated: true,
-                id: 0
-              });
-
-              console.log("[Participant] Created data channel with ID:", channel.id);
-              
-              channel.onopen = () => {
-                console.log("[Participant] Data Channel is open!");
-                
-                // Initialize message queue when channel opens
-                if (!messageQueue) {
-                  messageQueue = new MessageQueue(channel);
-                }
-                
-                clearTimeout(timeout);
-                resolve(channel);
-              };
-
-              channel.onclose = () => {
-                console.log("[Participant] Data Channel closed!");
-              };
-
-              channel.onerror = (event) => {
-                console.error("[Participant] Data Channel error:", event);
-              };
-              
-              channel.onmessage = (event) => {
-                try {
-                  const data = JSON.parse(event.data);
-                  
-                  // Handle ACK messages silently
-                  if (data.type === 'ack' && data.messageId) {
-                    if (messageQueue) {
-                      messageQueue.acknowledge(data.messageId);
-                    }
-                    return; // Don't process ACKs further
-                  }
-                  
-                  // For non-ACK messages that have a messageId, send ACK only if not processed before
-                  if (data.messageId && !processedMessageIds.has(data.messageId)) {
-                    processedMessageIds.add(data.messageId);
-                    
-                    // Only send ACK for messages that require reliability
-                    if (data.type === 'quiz' || data.type === 'answer') {
-                      if (channel.readyState === 'open') {
-                        const ack = JSON.stringify({
-                          type: 'ack',
-                          messageId: data.messageId,
-                          timestamp: Date.now()
-                        });
-                        channel.send(ack);
-                      }
-                    }
-                  }
-                } catch (err) {
-                  console.error('[Participant] Error processing message:', err);
-                }
-              };
-
-              // Save reference to the channel
-              receiveChannel = channel;
-
-              // If the channel is already open (rare but possible), resolve immediately
-              if (channel.readyState === 'open') {
-                console.log("[Participant] Data Channel already open!");
-                
-                // Initialize message queue
-                if (!messageQueue) {
-                  messageQueue = new MessageQueue(channel);
-                }
-                
-                clearTimeout(timeout);
-                resolve(channel);
-              }
-            } catch (err) {
-              console.error("[Participant] Failed to create data channel:", err);
-              // Continue - we'll try with ondatachannel as backup
-            }
-            
-            // Create and set local description (answer)
-            console.log("[Participant] Creating answer");
-            return participantPeer.createAnswer();
-          })
-          .then(answer => {
-            return participantPeer.setLocalDescription(answer);
-          })
-          .then(() => {
-            console.log("[Participant] Local description (answer) set");
-            
-            // Add existing ICE candidates after setting descriptions
-            if (session.creatorIce?.length) {
-              console.log("[Participant] Adding existing ICE candidates:", session.creatorIce.length);
-              return Promise.all(session.creatorIce.map((ice: RTCIceCandidateInit) => {
-                return participantPeer.addIceCandidate(new RTCIceCandidate(ice))
-                  .catch(err => console.error('[Participant] Failed to add ICE candidate:', err));
-              }));
-            }
-          })
-          .then(() => {
-            // Send answer to signaling server
-            console.log("[Participant] Sending answer to signaling server");
-            return fetch(`http://${hostAddress}/api/signal`, {
-              method: 'PUT',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ 
-                sessionId,
-                participantId,
-                answer: participantPeer.localDescription 
-              })
-            });
-          })
-          .then(response => {
-            if (!response.ok) {
-              throw new Error('Failed to send answer to signaling server');
-            }
-            console.log("[Participant] Answer sent successfully");
-          })
-          .catch(err => {
-            console.error("[Participant] Error in connection setup:", err);
-            reject(err);
-          });
+        await peer.addIceCandidate(ice);
       } catch (err) {
-        console.error("[Participant] Error in connection initialization:", err);
-        clearTimeout(timeout);
-        reject(err);
+        console.warn('[Creator] deferred addIceCandidate failed:', err);
       }
+    }
+  };
 
-      // Also listen for ondatachannel event as fallback
-      participantPeer.ondatachannel = (event) => {
-        console.log("[Participant] Received data channel from ondatachannel event");
-        const backupChannel = event.channel;
-
-        backupChannel.onopen = () => {
-          console.log("[Participant] Backup Data Channel is open!");
-          
-          // Initialize message queue for backup channel
-          if (!messageQueue && (receiveChannel === null || receiveChannel.readyState !== 'open')) {
-            messageQueue = new MessageQueue(backupChannel);
-          }
-          
-          if (!receiveChannel || receiveChannel.readyState !== 'open') {
-            clearTimeout(timeout);
-            resolve(backupChannel);
-          }
-        };
-
-        backupChannel.onclose = () => {
-          console.log("[Participant] Backup Data Channel closed!");
-        };
-
-        backupChannel.onerror = (event) => {
-          console.error("[Participant] Backup Data Channel error:", event);
-        };
-
-        backupChannel.onmessage = (event) => {
+  const pollOnce = async () => {
+    const data = await fetchSession(sessionId!);
+    const participants = data.participants ?? {};
+    for (const [pid, p] of Object.entries(participants)) {
+      if (p.answer?.sdp && appliedAnswers.get(pid) !== p.answer.sdp) {
+        try {
+          await peer.setRemoteDescription(p.answer);
+          appliedAnswers.set(pid, p.answer.sdp);
+          console.log('[Creator] Applied answer from', pid);
+          await flushPendingIce();
+        } catch (err) {
+          console.error('[Creator] setRemoteDescription failed:', err);
+        }
+      }
+      for (const ice of p.participantIce ?? []) {
+        const key = iceKey(ice);
+        if (seenIce.has(key)) continue;
+        seenIce.add(key);
+        if (peer.remoteDescription) {
           try {
-            const data = JSON.parse(event.data);
-            
-            // Handle ACK messages silently
-            if (data.type === 'ack' && data.messageId) {
-              if (messageQueue) {
-                messageQueue.acknowledge(data.messageId);
-              }
-              return; // Don't process ACKs further
-            }
-            
-            // For non-ACK messages that have a messageId, send ACK only if not processed before
-            if (data.messageId && !processedMessageIds.has(data.messageId)) {
-              processedMessageIds.add(data.messageId);
-              
-              // Only send ACK for messages that require reliability
-              if (data.type === 'quiz' || data.type === 'answer') {
-                if (backupChannel.readyState === 'open') {
-                  const ack = JSON.stringify({
-                    type: 'ack',
-                    messageId: data.messageId,
-                    timestamp: Date.now()
-                  });
-                  backupChannel.send(ack);
-                }
-              }
-            }
+            await peer.addIceCandidate(ice);
           } catch (err) {
-            console.error('[Participant] Error processing message on backup channel:', err);
+            console.warn('[Creator] addIceCandidate failed:', err);
           }
-        };
-      };
-    });
-
-    // Set up ICE candidate handling
-    participantPeer.onicecandidate = async (event) => {
-      if (event.candidate) {
-        console.log("[Participant] New ICE candidate");
-        try {
-          const response = await fetch(`http://${hostAddress}/api/signal`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              sessionId,
-              participantId,
-              ice: event.candidate.toJSON(),
-              role: 'participant'
-            })
-          });
-          if (!response.ok) {
-            console.error("[Participant] Failed to send ICE candidate");
-          }
-        } catch (err) {
-          console.error("[Participant] Error sending ICE candidate:", err);
+        } else {
+          pendingIce.push(ice);
         }
-      } else {
-        console.log("[Participant] ICE gathering complete");
       }
-    };
-
-    // Wait for data channel with a more informative timeout message
-    console.log("[Participant] Waiting for data channel to be established");
-    try {
-      const channel = await channelPromise;
-      console.log("[Participant] Data channel successfully established");
-      
-      // Ensure message queue is created
-      if (!messageQueue) {
-        messageQueue = new MessageQueue(channel);
-      }
-      
-      return {
-        participantPeer,
-        getChannel: () => channel,
-        sendReliableMessage: (data: any) => {
-          if (!messageQueue) {
-            console.error('[Participant] Cannot send message, no message queue available');
-            return null;
-          }
-          
-          let type = 'unknown';
-          try {
-            if (typeof data === 'object' && data !== null && 'type' in data) {
-              type = data.type;
-            }
-          } catch (e) {
-            // Ignore any errors in type extraction
-          }
-          
-          console.log(`[Participant] Preparing to send message of type: ${type}`);
-          
-          // Only use reliable messaging for answers and quizzes
-          const needsReliability = type === 'answer' || type === 'quiz';
-          
-          if (!needsReliability) {
-            // Send directly without queuing or message ID for heartbeats, acks, etc.
-            if (channel.readyState === 'open') {
-              const messageString = JSON.stringify(data);
-              channel.send(messageString);
-              return null;
-            }
-            return null;
-          }
-          
-          // For messages needing reliability (answers and quizzes)
-          let messageId = data.messageId;
-          if (!messageId) {
-            messageId = Math.random().toString(36).substring(2);
-          }
-          
-          // Add message ID for tracking
-          const message = {
-            ...data,
-            messageId
-          };
-          
-          console.log(`[Participant] Sending reliable message with ID: ${messageId}, type: ${type}`);
-          
-          // Log answer messages prominently
-          if (type === 'answer') {
-            console.log(`[Participant] SENDING ANSWER with ID: ${messageId} !!!`);
-          }
-          
-          const messageString = JSON.stringify(message);
-          return messageQueue.enqueue(messageString);
-        }
-      };
-    } catch (error) {
-      console.error("[Participant] Failed to establish data channel:", error);
-      throw error;
     }
+  };
+
+  const stopPolling = startPollingLoop(pollOnce, () =>
+    peer.connectionState === 'connected' ? SIGNAL_POLL_IDLE_MS : SIGNAL_POLL_ACTIVE_MS
+  );
+
+  let closed = false;
+  return {
+    peer,
+    sessionId,
+    sendReliable: (data) => messenger.sendReliable(data),
+    sendUnreliable: (data) => messenger.sendUnreliable(data),
+    onMessage: (h) => messenger.addMessageHandler(h),
+    onChannelStateChange: (h) => {
+      channelHandlers.add(h);
+      return () => channelHandlers.delete(h);
+    },
+    onConnectionStateChange: (h) => {
+      connHandlers.add(h);
+      return () => connHandlers.delete(h);
+    },
+    getChannelState: () => channel.readyState,
+    getConnectionState: () => peer.connectionState,
+    close: () => {
+      if (closed) return;
+      closed = true;
+      if (recoveryTimer) clearTimeout(recoveryTimer);
+      stopPolling();
+      messenger.close();
+      try {
+        channel.close();
+      } catch {
+        /* ignore */
+      }
+      try {
+        peer.close();
+      } catch {
+        /* ignore */
+      }
+    },
+  };
 }
-  
-export function addCreatorIceCandidate(
-  participantPeer: RTCPeerConnection,
-  candidate: RTCIceCandidate
-) {
-  participantPeer.addIceCandidate(candidate);
-}
-  
-// Poll for updates (new ICE candidates)
-export async function pollUpdates(
+
+// ---------- Participant ----------
+
+export async function joinConnection(
   sessionId: string,
-  role: 'creator' | 'participant',
-  peer: RTCPeerConnection,
-  participantId?: string
-) {
-  let processedIceCandidates = new Set<string>();
-  let pendingIceCandidates: RTCIceCandidateInit[] = [];
-  let hostAddress = typeof window !== 'undefined' ? window.location.host : 'localhost:3000';
-  
-  // Try to get the host address for better cross-device communication
-  try {
-    hostAddress = await getHostAddress();
-  } catch (err) {
-    console.warn("Could not get host address for API calls, using default");
-  }
+  participantId: string
+): Promise<P2PConnection> {
+  const peer = new RTCPeerConnection(ICE_CONFIGURATION);
+  console.log('[Participant] Joining session:', sessionId);
 
-  // Track consecutive failures to implement backoff
-  let consecutiveFailures = 0;
-  const MAX_FAILURES = 5;
-  let pollingInterval = 1000; // Start with 1 second
-  const MAX_POLLING_INTERVAL = 5000; // Max 5 seconds
+  const channel = peer.createDataChannel('quizChannel', DATA_CHANNEL_INIT);
+  console.log('[Participant] Data channel created with id', channel.id);
 
-  // Use let instead of const for interval so we can reassign it
-  let interval = setInterval(pollFunction, pollingInterval);
+  const messenger = new ReliableMessenger(channel, '[Participant]');
+  const channelHandlers = new Set<ChannelStateHandler>();
+  const connHandlers = new Set<ConnectionStateHandler>();
 
-  // Define the polling function that will be called at each interval
-  async function pollFunction() {
+  const notifyChannel = () => channelHandlers.forEach((h) => h(channel.readyState));
+  const notifyConn = () => connHandlers.forEach((h) => h(peer.connectionState));
+
+  channel.addEventListener('open', notifyChannel);
+  channel.addEventListener('close', notifyChannel);
+  channel.addEventListener('error', notifyChannel);
+  peer.addEventListener('connectionstatechange', notifyConn);
+
+  // ICE candidate dispatch; safe to register immediately, we always know sessionId here.
+  peer.onicecandidate = async (event) => {
+    if (!event.candidate) {
+      console.log('[Participant] ICE gathering complete');
+      return;
+    }
     try {
-      // If we have too many consecutive failures, increase polling interval
-      if (consecutiveFailures >= MAX_FAILURES) {
-        pollingInterval = Math.min(pollingInterval * 1.5, MAX_POLLING_INTERVAL);
-        console.log(`[${role}] Too many consecutive failures, increasing polling interval to ${pollingInterval}ms`);
-        clearInterval(interval);
-        interval = setInterval(pollFunction, pollingInterval);
-        consecutiveFailures = 0; // Reset after adjusting
-        return; // Skip this iteration after rescheduling
-      }
+      const r = await putJson({
+        sessionId,
+        participantId,
+        role: 'participant',
+        ice: event.candidate.toJSON(),
+      });
+      if (!r.ok) console.error('[Participant] ICE PUT rejected:', r.status);
+    } catch (err) {
+      console.error('[Participant] Failed to send ICE:', err);
+    }
+  };
 
-      let url: URL;
-      
-      if (role === 'participant') {
-        // Participants need the full URL with host for cross-device communication
-        // Always use the full URL with host address for participants
-        url = new URL(`http://${hostAddress}/api/signal`);
-      } else {
-        // Creators can use relative URLs since they're on the same device as the server
-        url = new URL('/api/signal', window.location.origin);
-      }
-      
-      url.searchParams.set('session', sessionId);
-      if (participantId) {
-        url.searchParams.set('participant', participantId);
-      }
+  // Initial session fetch + answer publication.
+  const initial = await fetchSession(sessionId, participantId);
+  if (!initial.offer) {
+    peer.close();
+    throw new Error('No offer found for this session');
+  }
+  await applyOfferAndSendAnswer(peer, initial.offer, sessionId, participantId);
+  let lastAppliedOfferSdp = initial.offer.sdp ?? '';
 
-      console.log(`[${role}] Polling updates from: ${url.toString()}`);
-      const response = await fetch(url.toString());
-      
-      if (!response.ok) {
-        // Get more information about the failed response
-        const statusText = response.statusText;
-        const status = response.status;
-        let responseText = '';
-        
-        try {
-          // Try to get response text for more context
-          responseText = await response.text();
-        } catch (textError) {
-          // If we can't get the response text, just continue
-          console.warn(`[${role}] Could not read response text:`, textError);
-        }
-        
-        throw new Error(
-          `Failed to poll updates: ${status} ${statusText}. ` + 
-          `URL: ${url.toString()}. ` +
-          (responseText ? `Response: ${responseText}` : 'No response text available.')
-        );
-      }
-
-      // We got a successful response, reset failure counter
-      consecutiveFailures = 0;
-
-      const session = await response.json();
-
-      if (role === 'creator' && session.participants) {
-        // Handle new participants and their ICE candidates
-        for (const [pid, participant] of Object.entries<{
-          answer?: RTCSessionDescriptionInit;
-          participantIce: RTCIceCandidateInit[];
-        }>(session.participants)) {
-          // First handle the answer if we haven't yet
-          if (participant.answer && !peer.remoteDescription) {
-            try {
-              console.log("[Creator] Setting remote description from answer");
-              await peer.setRemoteDescription(participant.answer);
-              
-              // After setting remote description, add any pending ICE candidates
-              for (const ice of pendingIceCandidates) {
-                try {
-                  await peer.addIceCandidate(new RTCIceCandidate(ice));
-                  processedIceCandidates.add(JSON.stringify(ice));
-                } catch (err) {
-                  console.error('[Creator] Failed to add pending ICE candidate:', err);
-                }
-              }
-              pendingIceCandidates = [];
-            } catch (err) {
-              console.error('[Creator] Failed to set remote description:', err);
-              continue;
-            }
-          }
-
-          // Then handle ICE candidates
-          if (participant.participantIce?.length) {
-            for (const ice of participant.participantIce) {
-              const iceString = JSON.stringify(ice);
-              if (!processedIceCandidates.has(iceString)) {
-                if (!peer.remoteDescription) {
-                  // Store ICE candidate for later if remote description isn't set
-                  pendingIceCandidates.push(ice);
-                  processedIceCandidates.add(iceString);
-                } else {
-                  try {
-                    await peer.addIceCandidate(new RTCIceCandidate(ice));
-                    processedIceCandidates.add(iceString);
-                  } catch (err) {
-                    console.error('[Creator] Failed to add ICE candidate:', err);
-                  }
-                }
-              }
-            }
-          }
-        }
-      } else if (role === 'participant' && session.creatorIce?.length) {
-        for (const ice of session.creatorIce) {
-          const iceString = JSON.stringify(ice);
-          if (!processedIceCandidates.has(iceString)) {
-            if (!peer.remoteDescription) {
-              // Store ICE candidate for later if remote description isn't set
-              pendingIceCandidates.push(ice);
-              processedIceCandidates.add(iceString);
-            } else {
-              try {
-                await peer.addIceCandidate(new RTCIceCandidate(ice));
-                processedIceCandidates.add(iceString);
-              } catch (err) {
-                console.error('[Participant] Failed to add ICE candidate:', err);
-              }
-            }
-          }
-        }
-      }
-
-      // Check if connection is established - if so, we can stop polling
-      if (peer.connectionState === 'connected' && peer.iceConnectionState === 'connected') {
-        console.log(`[${role}] Connection fully established, stopping polling`);
-        clearInterval(interval);
-      }
-    } catch (error) {
-      // Increment failure counter
-      consecutiveFailures++;
-      
-      console.error(`[${role}] Error polling updates (failure #${consecutiveFailures}):`, error);
-      
-      // Add retry logic when connection issues occur
-      if (peer.connectionState !== 'connected') {
-        console.log(`[${role}] Connection not established yet, continuing to poll...`);
-      }
+  const seenIce = new Set<string>();
+  for (const ice of initial.creatorIce ?? []) {
+    seenIce.add(iceKey(ice));
+    try {
+      await peer.addIceCandidate(ice);
+    } catch (err) {
+      console.warn('[Participant] initial addIceCandidate failed:', err);
     }
   }
 
-  // Start by calling the function immediately
-  pollFunction();
+  const pollOnce = async () => {
+    const session = await fetchSession(sessionId, participantId);
 
-  return () => clearInterval(interval);
+    // Detect renegotiation (e.g. ICE restart from creator).
+    if (session.offer?.sdp && session.offer.sdp !== lastAppliedOfferSdp) {
+      console.log('[Participant] Applying renegotiated offer');
+      try {
+        await applyOfferAndSendAnswer(peer, session.offer, sessionId, participantId);
+        lastAppliedOfferSdp = session.offer.sdp;
+        // Creator-side ICE was cleared on renegotiation; fresh candidates will arrive.
+        seenIce.clear();
+      } catch (err) {
+        console.error('[Participant] Failed to apply renegotiation:', err);
+      }
+    }
+
+    for (const ice of session.creatorIce ?? []) {
+      const key = iceKey(ice);
+      if (seenIce.has(key)) continue;
+      seenIce.add(key);
+      try {
+        await peer.addIceCandidate(ice);
+      } catch (err) {
+        console.warn('[Participant] addIceCandidate failed:', err);
+      }
+    }
+  };
+
+  const stopPolling = startPollingLoop(pollOnce, () =>
+    peer.connectionState === 'connected' ? SIGNAL_POLL_IDLE_MS : SIGNAL_POLL_ACTIVE_MS
+  );
+
+  let closed = false;
+  return {
+    peer,
+    sessionId,
+    sendReliable: (data) => messenger.sendReliable(data),
+    sendUnreliable: (data) => messenger.sendUnreliable(data),
+    onMessage: (h) => messenger.addMessageHandler(h),
+    onChannelStateChange: (h) => {
+      channelHandlers.add(h);
+      return () => channelHandlers.delete(h);
+    },
+    onConnectionStateChange: (h) => {
+      connHandlers.add(h);
+      return () => connHandlers.delete(h);
+    },
+    getChannelState: () => channel.readyState,
+    getConnectionState: () => peer.connectionState,
+    close: () => {
+      if (closed) return;
+      closed = true;
+      stopPolling();
+      messenger.close();
+      try {
+        channel.close();
+      } catch {
+        /* ignore */
+      }
+      try {
+        peer.close();
+      } catch {
+        /* ignore */
+      }
+    },
+  };
+}
+
+async function applyOfferAndSendAnswer(
+  peer: RTCPeerConnection,
+  offer: RTCSessionDescriptionInit,
+  sessionId: string,
+  participantId: string
+): Promise<void> {
+  await peer.setRemoteDescription(offer);
+  const answer = await peer.createAnswer();
+  await peer.setLocalDescription(answer);
+
+  const r = await putJson({
+    sessionId,
+    participantId,
+    role: 'participant',
+    answer: peer.localDescription,
+  });
+  if (!r.ok) throw new Error(`Failed to send answer: ${r.status} ${r.statusText}`);
 }

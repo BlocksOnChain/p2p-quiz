@@ -1,8 +1,8 @@
 'use client';
 
-import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { createConnection, joinConnection, pollUpdates } from '@/lib/p2p';
-import { useSearchParams, useRouter } from 'next/navigation';
+import React, { Suspense, useState, useRef, useEffect, useCallback } from 'react';
+import { createConnection, joinConnection, P2PConnection } from '@/lib/p2p';
+import { useSearchParams } from 'next/navigation';
 import { Inter } from 'next/font/google';
 import { QRCodeSVG } from 'qrcode.react';
 import { getHostAddress } from '@/lib/utils';
@@ -14,6 +14,8 @@ interface QuizMessage {
   type: 'quiz' | 'answer' | 'info' | 'heartbeat';
   payload: string;
   participantId?: string;
+  // Allow the P2P layer to attach its envelope fields (e.g. messageId).
+  [key: string]: unknown;
 }
 
 interface Quiz {
@@ -42,9 +44,8 @@ interface DraftQuiz {
   points: number;
 }
 
-export default function HomePage() {
+function HomePageContent() {
   const searchParams = useSearchParams();
-  const router = useRouter();
 
   // Get mode and session ID from URL
   const sessionId = searchParams.get('session');
@@ -65,8 +66,8 @@ export default function HomePage() {
   const [creatorSessionId, setCreatorSessionId] = useState<string>('');
   const [connectedParticipants, setConnectedParticipants] = useState<Set<string>>(new Set());
 
-  const creatorPeerRef = useRef<Map<string, RTCPeerConnection>>(new Map());
-  const dataChannelRef = useRef<Map<string, RTCDataChannel>>(new Map());
+  // Single live connection for the current role (creator or participant).
+  const connectionRef = useRef<P2PConnection | null>(null);
 
   // Add new state for quiz settings
   const [timeLimit, setTimeLimit] = useState(60); // default 60 seconds
@@ -76,20 +77,15 @@ export default function HomePage() {
 
   // Add state for draft questions
   const [draftQuizzes, setDraftQuizzes] = useState<DraftQuiz[]>([]);
-  const [isEditing, setIsEditing] = useState(false);
 
   // Add new state for tracking message delivery status
   const [messageSendingStatus, setMessageSendingStatus] = useState<'idle' | 'sending' | 'sent' | 'failed'>('idle');
   const [heartbeatStatus, setHeartbeatStatus] = useState<'connected' | 'reconnecting' | 'disconnected'>('disconnected');
   const heartbeatIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastHeartbeatResponseRef = useRef<number>(0);
-  const reliableSenderRef = useRef<((data: any) => string | null) | null>(null);
 
-  // Add a new state for host address
+  // Host address used for building shareable QR/link on the creator side.
   const [hostAddress, setHostAddress] = useState<string>('');
-  
-  // Add new state for tracking processed message IDs
-  const processedMessageIdsRef = useRef<Set<string>>(new Set());
   
   // Fetch the host address when the component mounts
   useEffect(() => {
@@ -100,55 +96,39 @@ export default function HomePage() {
     fetchHostAddress();
   }, []);
 
-  // Function to start heartbeat mechanism
-  const startHeartbeat = useCallback((channel: RTCDataChannel, sendReliable?: (data: any) => string | null) => {
-    if (heartbeatIntervalRef.current) {
-      clearInterval(heartbeatIntervalRef.current);
-    }
+  // Close the connection and stop the heartbeat when the page unmounts.
+  useEffect(() => {
+    return () => {
+      if (heartbeatIntervalRef.current) {
+        clearInterval(heartbeatIntervalRef.current);
+        heartbeatIntervalRef.current = null;
+      }
+      connectionRef.current?.close();
+      connectionRef.current = null;
+    };
+  }, []);
 
-    // Store the reliable sender if provided
-    if (sendReliable) {
-      reliableSenderRef.current = sendReliable;
-    }
+  // Start a best-effort heartbeat over the given connection. Heartbeats are
+  // sent as unreliable messages: they are frequent, transient, and don't
+  // belong in the reliable-retry queue.
+  const startHeartbeat = useCallback((connection: P2PConnection) => {
+    if (heartbeatIntervalRef.current) clearInterval(heartbeatIntervalRef.current);
 
     lastHeartbeatResponseRef.current = Date.now();
-    
+    setHeartbeatStatus('connected');
+
     heartbeatIntervalRef.current = setInterval(() => {
-      // Check if we've received a response recently
       const timeSinceLastResponse = Date.now() - lastHeartbeatResponseRef.current;
-      
-      if (timeSinceLastResponse > 10000) { // 10 seconds
-        // Haven't received a response for too long
+      if (timeSinceLastResponse > 10_000) {
         setHeartbeatStatus('disconnected');
         setConnectionStatus('disconnected');
-      } else if (timeSinceLastResponse > 5000) { // 5 seconds
-        // Getting concerning, mark as reconnecting
+      } else if (timeSinceLastResponse > 5_000) {
         setHeartbeatStatus('reconnecting');
       }
-      
-      // Send new heartbeat
-      try {
-        // Try using reliable message if available
-        if (reliableSenderRef.current) {
-          reliableSenderRef.current({
-            type: 'heartbeat',
-            timestamp: Date.now()
-          });
-        } else if (channel.readyState === 'open') {
-          // Fallback to regular send
-          channel.send(JSON.stringify({
-            type: 'heartbeat',
-            timestamp: Date.now()
-          }));
-        }
-      } catch (err) {
-        console.error('Failed to send heartbeat:', err);
-      }
-    }, 3000); // Send heartbeat every 3 seconds
-    
-    // Set initial status as connected
-    setHeartbeatStatus('connected');
-    
+
+      connection.sendUnreliable({ type: 'heartbeat', timestamp: Date.now() });
+    }, 3000);
+
     return () => {
       if (heartbeatIntervalRef.current) {
         clearInterval(heartbeatIntervalRef.current);
@@ -157,124 +137,108 @@ export default function HomePage() {
     };
   }, []);
 
+  // Shared wiring of a P2PConnection to React state: connection/channel
+  // state indicators and the common bookkeeping every screen needs.
+  const wireConnection = useCallback(
+    (connection: P2PConnection, label: 'Creator' | 'Participant') => {
+      const unsubs: Array<() => void> = [];
+
+      unsubs.push(
+        connection.onConnectionStateChange((state) => {
+          console.log(`[${label}] connection state:`, state);
+          setConnectionStatus(state);
+          if (state === 'connected') {
+            setError(null);
+          } else if (state === 'failed' || state === 'closed') {
+            setError(
+              label === 'Creator'
+                ? 'Connection to participant lost. They may need to reconnect.'
+                : 'Connection lost. Please try reconnecting.'
+            );
+          }
+        })
+      );
+
+      unsubs.push(
+        connection.onChannelStateChange((state) => {
+          console.log(`[${label}] channel state:`, state);
+          if (state === 'open') {
+            setConnectionStatus('connected');
+            setError(null);
+          }
+        })
+      );
+
+      return () => {
+        for (const u of unsubs) u();
+      };
+    },
+    []
+  );
+
   // Creator: create quiz & WebRTC connection
   const handleCreateQuiz = async () => {
     setError(null);
     setIsLoading(true);
     try {
-      const { creatorPeer, dataChannel, sessionId, sendReliableMessage } = await createConnection();
-      creatorPeerRef.current.set(sessionId, creatorPeer);
-      dataChannelRef.current.set(sessionId, dataChannel);
-      setCreatorSessionId(sessionId);
-      
-      // Store the reliable message sender
-      reliableSenderRef.current = sendReliableMessage;
+      // Tear down any previous connection first.
+      connectionRef.current?.close();
+      connectionRef.current = null;
 
-      // Monitor connection state
-      creatorPeer.onconnectionstatechange = () => {
-        const state = creatorPeer.connectionState;
-        console.log("[Creator Frontend] Connection state changed:", state);
-        setConnectionStatus(state);
-        if (state === 'failed' || state === 'disconnected' || state === 'closed') {
-          setError('Connection to participant lost. They may need to reconnect.');
-          // Don't clear connected participants immediately as they may reconnect
-          // Instead, mark them as potentially disconnected via the heartbeat mechanism
-        } else if (state === 'connected') {
-          // Clear any existing error on successful connection
-          setError(null);
-          
-          // Only update connected participants if we have a valid session ID
-          if (typeof creatorSessionId === 'string' && creatorSessionId.length > 0) {
-            setConnectedParticipants(new Set([creatorSessionId]));
-          }
-        }
-      };
+      const connection = await createConnection();
+      connectionRef.current = connection;
+      setCreatorSessionId(connection.sessionId);
 
-      dataChannel.onmessage = (event) => {
-        try {
-          const parsed = JSON.parse(event.data);
-          
-          // Handle ACK messages silently
-          if (parsed.type === 'ack' && parsed.messageId) {
-            return; // Don't process ACKs further
-          }
-          
-          // Only send ACK for non-ACK messages with messageId that we haven't processed
-          if (parsed.messageId && !processedMessageIdsRef.current.has(parsed.messageId)) {
-            processedMessageIdsRef.current.add(parsed.messageId);
-            
-            // Only send ACK for messages that require reliability
-            if (parsed.type === 'quiz' || parsed.type === 'answer') {
-              const ack = JSON.stringify({
-                type: 'ack',
-                messageId: parsed.messageId,
-                timestamp: Date.now()
-              });
-              
-              if (dataChannel.readyState === 'open') {
-                dataChannel.send(ack);
-              }
-            }
-          }
-          
-          // Handle heartbeat response
-          if (parsed.type === 'heartbeat') {
-            lastHeartbeatResponseRef.current = Date.now();
-            setHeartbeatStatus('connected');
-            
-            // If a participant ID is included, mark them as connected
-            if (parsed.participantId) {
-              setConnectedParticipants(prev => {
-                const updated = new Set(prev);
-                updated.add(parsed.participantId);
-                return updated;
-              });
-            }
-            return;
-          }
-          
-          if (parsed.type === 'answer' && parsed.participantId) {
-            const answerData = JSON.parse(parsed.payload);
-            console.log("[Creator] Received answer:", answerData);
-            
-            // Check if we already have this answer (prevent duplicates)
-            const isDuplicate = participantAnswers.some(
-              a => a.quizId === answerData.quizId && a.participantId === parsed.participantId
-            );
-            
-            if (!isDuplicate) {
-              const answer: Answer = {
-                quizId: answerData.quizId,
-                participantId: parsed.participantId,
-                answer: answerData.answer,
-                timestamp: Date.now(),
-                timeTaken: answerData.timeTaken,
-                score: answerData.score
-              };
-              setParticipantAnswers(prev => [...prev, answer]);
-            } else {
-              console.log("[Creator] Ignoring duplicate answer");
-            }
-            
-            // Update connected participants
-            setConnectedParticipants(prev => {
+      wireConnection(connection, 'Creator');
+
+      connection.onMessage((parsed) => {
+        if (parsed.type === 'heartbeat') {
+          lastHeartbeatResponseRef.current = Date.now();
+          setHeartbeatStatus('connected');
+          const pid = parsed.participantId;
+          if (typeof pid === 'string') {
+            setConnectedParticipants((prev) => {
               const updated = new Set(prev);
-              if (parsed.participantId) {
-                updated.add(parsed.participantId);
-              }
+              updated.add(pid);
               return updated;
             });
           }
-        } catch (err) {
-          console.error('Error processing message:', err);
+          return;
         }
-      };
 
-      // Start polling for updates
-      pollUpdates(sessionId, 'creator', creatorPeer);
-      
-      // Start heartbeat
-      startHeartbeat(dataChannel, sendReliableMessage);
+        if (parsed.type === 'answer') {
+          const pid = parsed.participantId;
+          const payload = parsed.payload;
+          if (typeof pid !== 'string' || typeof payload !== 'string') return;
+          try {
+            const answerData = JSON.parse(payload);
+            console.log('[Creator] Received answer:', answerData);
+            const newAnswer: Answer = {
+              quizId: answerData.quizId,
+              participantId: pid,
+              answer: answerData.answer,
+              timestamp: Date.now(),
+              timeTaken: answerData.timeTaken,
+              score: answerData.score,
+            };
+            setParticipantAnswers((prev) => {
+              if (prev.some((a) => a.quizId === newAnswer.quizId && a.participantId === newAnswer.participantId)) {
+                return prev;
+              }
+              return [...prev, newAnswer];
+            });
+            setConnectedParticipants((prev) => {
+              const updated = new Set(prev);
+              updated.add(pid);
+              return updated;
+            });
+          } catch (err) {
+            console.error('[Creator] Failed to parse answer payload:', err);
+          }
+        }
+      });
+
+      startHeartbeat(connection);
     } catch (err) {
       console.error(err);
       setError('Failed to create quiz session. Please try again.');
@@ -309,19 +273,18 @@ export default function HomePage() {
 
   // Function to update quiz sending logic to handle multiple questions
   const handleSendQuiz = () => {
-    if (!dataChannelRef.current.size || ![...dataChannelRef.current.values()].every(dc => dc.readyState === 'open')) {
-      alert('Not all connections are ready yet!');
+    const connection = connectionRef.current;
+    if (!connection || connection.getChannelState() !== 'open') {
+      alert('Connection is not ready yet!');
       return;
     }
 
-    // Check if we have any questions to send
-    const questionsToSend = draftQuizzes.length > 0 ? draftQuizzes : 
-      (quizQuestion.trim() && quizAnswer.trim() ? [{
-        question: quizQuestion,
-        correctAnswer: quizAnswer,
-        timeLimit,
-        points
-      }] : []);
+    const questionsToSend =
+      draftQuizzes.length > 0
+        ? draftQuizzes
+        : quizQuestion.trim() && quizAnswer.trim()
+        ? [{ question: quizQuestion, correctAnswer: quizAnswer, timeLimit, points }]
+        : [];
 
     if (questionsToSend.length === 0) {
       alert('Please add at least one question!');
@@ -330,68 +293,41 @@ export default function HomePage() {
 
     try {
       setMessageSendingStatus('sending');
-      
-      // Keep track of sent message IDs for logging
       const sentMessageIds: string[] = [];
-      
-      // Send each quiz
-      questionsToSend.forEach(draft => {
-        const quizId = Math.random().toString(36).substring(2);
-        
-        // Check if quiz with this ID already exists
-        if (sentQuizzes.some(q => q.id === quizId)) {
-          console.log(`Quiz with ID ${quizId} already exists, generating new ID`);
-          return; // Skip this iteration and try again with new ID
-        }
-        
+
+      for (const draft of questionsToSend) {
         const newQuiz: Quiz = {
-          id: quizId,
+          id: Math.random().toString(36).substring(2),
           question: draft.question,
           correctAnswer: draft.correctAnswer,
           timestamp: Date.now(),
           timeLimit: draft.timeLimit,
-          points: draft.points
+          points: draft.points,
         };
 
         const message: QuizMessage = {
           type: 'quiz',
-          payload: JSON.stringify(newQuiz)
+          payload: JSON.stringify(newQuiz),
         };
 
-        // Send to all connected participants using reliable messaging if available
-        if (reliableSenderRef.current) {
-          const messageId = reliableSenderRef.current(message);
-          if (messageId) {
-            sentMessageIds.push(messageId);
-            console.log(`Sent quiz ${quizId} with message ID ${messageId}`);
-          }
-        } else {
-          // Fallback to regular send
-          dataChannelRef.current.forEach(channel => {
-            if (channel.readyState === 'open') {
-              channel.send(JSON.stringify(message));
-            }
-          });
-        }
+        const messageId = connection.sendReliable(message);
+        if (messageId) sentMessageIds.push(messageId);
 
-        // Update local state with the new quiz
-        setSentQuizzes(prev => [...prev, newQuiz]);
-      });
+        setSentQuizzes((prev) => [...prev, newQuiz]);
+      }
 
-      // Clear draft questions and inputs
       setDraftQuizzes([]);
       setQuizQuestion('');
       setQuizAnswer('');
-      
+
       setMessageSendingStatus('sent');
       setTimeout(() => setMessageSendingStatus('idle'), 2000);
-      
-      console.log(`Quizzes sent successfully with message IDs: ${sentMessageIds.join(', ')}`);
-      alert('Quizzes sent successfully to all participants!');
+
+      console.log(`Quizzes queued for delivery with message IDs: ${sentMessageIds.join(', ')}`);
     } catch (err) {
       console.error('Error sending quizzes:', err);
       setMessageSendingStatus('failed');
-      alert('Failed to send quizzes to some participants');
+      alert('Failed to send quizzes');
     }
   };
 
@@ -403,217 +339,68 @@ export default function HomePage() {
   const [myAnswers, setMyAnswers] = useState<Map<string, string>>(new Map());
   const [participantId] = useState(() => Math.random().toString(36).substring(2));
 
-  const participantPeerRef = useRef<RTCPeerConnection | null>(null);
-  const participantChannelRef = useRef<RTCDataChannel | null>(null);
-
   // Join quiz when session ID is present
   useEffect(() => {
     if (sessionId && mode === 'participant') {
       handleJoinQuiz(sessionId);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, mode]);
 
   // Participant: join the quiz
   const handleJoinQuiz = async (sid: string) => {
     setError(null);
     setIsLoading(true);
-    
-    // Clear any existing state to ensure fresh connection
-    if (participantPeerRef.current) {
-      try {
-        participantPeerRef.current.close();
-      } catch (err) {
-        console.log("Error closing existing peer connection:", err);
-      }
-      participantPeerRef.current = null;
-    }
-    
-    if (participantChannelRef.current) {
-      try {
-        participantChannelRef.current.close();
-      } catch (err) {
-        console.log("Error closing existing data channel:", err);
-      }
-      participantChannelRef.current = null;
-    }
-    
-    // Reset connection states
+
+    // Tear down any previous connection to start fresh.
+    connectionRef.current?.close();
+    connectionRef.current = null;
+
     setConnectionStatus('connecting');
     setHeartbeatStatus('disconnected');
-    
+
     try {
-      const { participantPeer, getChannel, sendReliableMessage } = await joinConnection(sid, participantId);
-      participantPeerRef.current = participantPeer;
-      
-      // Store reliable sender
-      reliableSenderRef.current = sendReliableMessage;
+      const connection = await joinConnection(sid, participantId);
+      connectionRef.current = connection;
 
-      // Monitor connection state with more detailed logging
-      participantPeer.onconnectionstatechange = () => {
-        const state = participantPeer.connectionState;
-        console.log("[Participant Frontend] Connection state changed:", state);
-        setConnectionStatus(state);
-        
-        // Only update error if we're disconnected and not in a temporary state
-        if (state === 'failed' || state === 'closed') {
-          setError('Connection lost. Please try reconnecting.');
-        } else if (state === 'connected') {
-          console.log("[Participant Frontend] Successfully connected to creator");
-          // Clear any existing error on successful connection
-          setError(null);
+      wireConnection(connection, 'Participant');
+
+      connection.onMessage((parsed) => {
+        if (parsed.type === 'heartbeat') {
+          lastHeartbeatResponseRef.current = Date.now();
+          setHeartbeatStatus('connected');
+          // Reply so the creator sees us as connected too. Include our
+          // participantId so the creator can track who replied.
+          connection.sendUnreliable({
+            type: 'heartbeat',
+            participantId,
+            timestamp: Date.now(),
+          });
+          return;
         }
-      };
 
-      // Check if the data channel is available immediately
-      try {
-        const channel = getChannel();
-        if (channel) {
-          console.log("[Participant Frontend] Data channel available immediately");
-          setupDataChannel(channel);
-          
-          // Start heartbeat mechanism
-          startHeartbeat(channel, sendReliableMessage);
-        } else {
-          console.log("[Participant Frontend] Waiting for data channel...");
-          // Setup data channel after connection
-          let retries = 0;
-          const maxRetries = 20;
-          const interval = setInterval(() => {
-            try {
-              const newChannel = getChannel();
-              if (newChannel) {
-                console.log("[Participant Frontend] Data channel obtained after retry");
-                clearInterval(interval);
-                setupDataChannel(newChannel);
-                
-                // Start heartbeat mechanism
-                startHeartbeat(newChannel, sendReliableMessage);
-              } else if (retries++ >= maxRetries) {
-                clearInterval(interval);
-                setError('Failed to establish data channel. Please try reconnecting.');
-                console.error("[Participant Frontend] Failed to get data channel after max retries");
-              }
-            } catch (err) {
-              console.error("[Participant Frontend] Error getting channel during retry:", err);
-              if (retries++ >= maxRetries) {
-                clearInterval(interval);
-                setError('Failed to establish data channel. Please try reconnecting.');
-              }
-            }
-          }, 500);
+        if (parsed.type === 'quiz') {
+          const payload = parsed.payload;
+          if (typeof payload !== 'string') return;
+          try {
+            const quiz: Quiz = JSON.parse(payload);
+            setReceivedQuizzes((prev) =>
+              prev.find((q) => q.id === quiz.id) ? prev : [...prev, quiz]
+            );
+            setCurrentQuizId((current) => current || quiz.id);
+          } catch (err) {
+            console.error('[Participant] Failed to parse quiz payload:', err);
+          }
         }
-      } catch (err) {
-        console.error("[Participant Frontend] Error getting initial data channel:", err);
-        // Continue anyway as the channel might become available during polling
-      }
+      });
 
-      // Start polling for updates
-      pollUpdates(sid, 'participant', participantPeer, participantId);
+      startHeartbeat(connection);
     } catch (err) {
-      console.error("[Participant Frontend] Error joining quiz:", err);
+      console.error('[Participant] Error joining quiz:', err);
       setError('Failed to join quiz session. The session may be invalid or expired.');
     } finally {
       setIsLoading(false);
     }
-  };
-
-  // Helper function to setup data channel
-  const setupDataChannel = (channel: RTCDataChannel) => {
-    participantChannelRef.current = channel;
-    
-    console.log("[Participant Frontend] Setting up data channel:", channel.readyState);
-    
-    // If the channel is already open, update status immediately
-    if (channel.readyState === 'open') {
-      console.log("[Participant Frontend] Data channel already open");
-      setConnectionStatus('connected');
-    }
-    
-    channel.onopen = () => {
-      console.log("[Participant Frontend] Data channel opened");
-      setConnectionStatus('connected');
-      // Clear any error messages when channel successfully opens
-      setError(null);
-    };
-
-    channel.onclose = () => {
-      console.log("[Participant Frontend] Data channel closed");
-      // Only set to disconnected if peer is also not connected
-      if (!participantPeerRef.current || 
-          participantPeerRef.current.connectionState !== 'connected') {
-        setConnectionStatus('disconnected');
-      }
-    };
-
-    channel.onerror = (error) => {
-      console.error("[Participant Frontend] Data channel error:", error);
-      setError('Data channel error occurred. Please try refreshing the page.');
-    };
-
-    channel.onmessage = (event) => {
-      try {
-        const parsed = JSON.parse(event.data);
-        
-        // Handle ACK messages silently
-        if (parsed.type === 'ack' && parsed.messageId) {
-          return; // Don't process ACKs further
-        }
-        
-        // Only send ACK for non-ACK messages with messageId that we haven't processed
-        if (parsed.messageId && !processedMessageIdsRef.current.has(parsed.messageId)) {
-          processedMessageIdsRef.current.add(parsed.messageId);
-          
-          // Only send ACK for messages that require reliability
-          if (parsed.type === 'quiz' || parsed.type === 'answer') {
-            const ack = JSON.stringify({
-              type: 'ack',
-              messageId: parsed.messageId,
-              timestamp: Date.now()
-            });
-            
-            if (channel.readyState === 'open') {
-              channel.send(ack);
-            }
-          }
-        }
-        
-        // Handle heartbeat messages
-        if (parsed.type === 'heartbeat') {
-          // Update last heartbeat received time
-          lastHeartbeatResponseRef.current = Date.now();
-          setHeartbeatStatus('connected');
-          
-          // Send heartbeat response back
-          if (reliableSenderRef.current) {
-            reliableSenderRef.current({
-              type: 'heartbeat',
-              timestamp: Date.now()
-            });
-          } else {
-            channel.send(JSON.stringify({
-              type: 'heartbeat',
-              timestamp: Date.now()
-            }));
-          }
-          return;
-        }
-        
-        if (parsed.type === 'quiz') {
-          const quiz: Quiz = JSON.parse(parsed.payload);
-          setReceivedQuizzes(prev => {
-            // Only add if not already present
-            if (!prev.find(q => q.id === quiz.id)) {
-              return [...prev, quiz];
-            }
-            return prev;
-          });
-          // Set as current quiz if none selected
-          setCurrentQuizId(current => current || quiz.id);
-        }
-      } catch (err) {
-        console.error("[Participant Frontend] Failed to parse message:", err);
-      }
-    };
   };
 
   // Add timer functionality for participants
@@ -649,12 +436,12 @@ export default function HomePage() {
 
   // Update answer handling to use reliable messaging
   const handleSendAnswer = (quizId: string, isTimeUp: boolean = false) => {
-    if (!participantChannelRef.current || participantChannelRef.current.readyState !== 'open') {
-      alert('Connection not ready yet!');
+    const connection = connectionRef.current;
+    if (!connection || connection.getChannelState() !== 'open') {
+      if (!isTimeUp) alert('Connection not ready yet!');
       return;
     }
 
-    // Check if we've already submitted an answer and it's in the scores map
     if (scores.has(quizId)) {
       console.log(`Answer for quiz ${quizId} already submitted, ignoring duplicate submission`);
       return;
@@ -666,54 +453,40 @@ export default function HomePage() {
       return;
     }
 
-    const quiz = receivedQuizzes.find(q => q.id === quizId);
+    const quiz = receivedQuizzes.find((q) => q.id === quizId);
     if (!quiz) return;
 
     const timeTaken = Math.floor((Date.now() - quiz.timestamp) / 1000);
-    const isCorrect = answer.toLowerCase().trim() === quiz.correctAnswer.toLowerCase().trim();
-    const score = isCorrect ? 
-      Math.max(0, quiz.points || 0) * (quiz.timeLimit ? Math.max(0, (quiz.timeLimit - timeTaken) / quiz.timeLimit) : 1) 
+    const isCorrect =
+      answer.toLowerCase().trim() === quiz.correctAnswer.toLowerCase().trim();
+    const score = isCorrect
+      ? Math.max(0, quiz.points || 0) *
+        (quiz.timeLimit ? Math.max(0, (quiz.timeLimit - timeTaken) / quiz.timeLimit) : 1)
       : 0;
 
     const msg: QuizMessage = {
       type: 'answer',
       participantId,
-      payload: JSON.stringify({
-        quizId,
-        answer,
-        timeTaken,
-        score
-      })
+      payload: JSON.stringify({ quizId, answer, timeTaken, score }),
     };
 
     setMessageSendingStatus('sending');
-    
     try {
-      // Use reliable messaging if available
-      let messageId = null;
-      if (reliableSenderRef.current) {
-        messageId = reliableSenderRef.current(msg);
-      } else {
-        participantChannelRef.current.send(JSON.stringify(msg));
-      }
-      
-      // Immediately record this score to prevent duplicate submissions
-      setScores(prev => new Map(prev).set(quizId, score));
-      
-      // Store the message ID to prevent duplicate submissions
+      const messageId = connection.sendReliable(msg);
+      // Record locally so the UI locks the answer regardless of delivery
+      // timing; the reliable queue will continue retrying behind the scenes.
+      setScores((prev) => new Map(prev).set(quizId, score));
+
       if (messageId) {
-        console.log(`Sent answer for quiz ${quizId} with message ID ${messageId}`);
+        console.log(`Queued answer for quiz ${quizId} with message ID ${messageId}`);
       }
-      
+
       setMessageSendingStatus('sent');
       setTimeout(() => setMessageSendingStatus('idle'), 2000);
-      
     } catch (err) {
       console.error('Error sending answer:', err);
       setMessageSendingStatus('failed');
-      if (!isTimeUp) {
-        alert('Failed to send answer');
-      }
+      if (!isTimeUp) alert('Failed to send answer');
     }
   };
 
@@ -1329,5 +1102,15 @@ export default function HomePage() {
         </footer>
       </div>
     </main>
+  );
+}
+
+// `useSearchParams` suspends on the client; wrap to satisfy Next.js's
+// prerender contract and avoid a CSR bailout during build.
+export default function HomePage() {
+  return (
+    <Suspense fallback={null}>
+      <HomePageContent />
+    </Suspense>
   );
 }
