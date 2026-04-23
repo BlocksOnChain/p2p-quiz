@@ -297,7 +297,6 @@ class ReliableMessenger {
       this.pending.delete(message.messageId);
       return;
     }
-  };
 
     if (this.channel.readyState !== 'open') {
       // Don't burn attempts while disconnected; we'll retry on 'open'.

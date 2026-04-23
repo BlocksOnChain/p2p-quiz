@@ -136,7 +136,7 @@ function HomePageContent() {
         heartbeatIntervalRef.current = null;
       }
     };
-  }, [creatorSessionId, connectionStatus, heartbeatStatus]);
+  }, []);
 
   // Shared wiring of a P2PConnection to React state: connection/channel
   // state indicators and the common bookkeeping every screen needs.
@@ -432,6 +432,10 @@ function HomePageContent() {
         setQuizTimer(null);
       };
     }
+    // handleTimeUp depends on the same state this effect already observes,
+    // so including it as a dep would cause the timer to restart on every
+    // render without adding correctness.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentQuizId, mode, myAnswers, receivedQuizzes]);
 
   // Handle time up for a quiz
@@ -938,114 +942,40 @@ function HomePageContent() {
     );
   };
 
-  // Add a reconnection function
+  // Reconnection: the new P2PConnection API already handles ICE restarts and
+  // polling internally, so "reconnect" here means tear down the current
+  // connection and redo the initial handshake. For participants we keep the
+  // original session id that was shared with them.
   const attemptReconnection = useCallback(async () => {
-    console.log("[Reconnection] Attempting to reestablish connection");
-    setIsLoading(true);
-    
+    console.log('[Reconnection] Attempting to reestablish connection');
     try {
-      // Only attempt reconnection if we're in creator mode and have a session ID
-      if (mode === 'creator' && creatorSessionId) {
-        // Check if the old connection is still usable
-        const oldPeer = creatorPeerRef.current.get(creatorSessionId);
-        if (oldPeer && 
-            (oldPeer.connectionState === 'connected' || oldPeer.iceConnectionState === 'connected')) {
-          console.log("[Reconnection] Existing connection still appears valid, skipping reconnection");
-          setConnectionStatus('connected');
-          setHeartbeatStatus('connected');
-          setIsLoading(false);
-          return;
-        }
-        
-        // For creator, if we're reconnecting we should use createConnection without expecting a new sessionId
-        // This ensures we keep using the same peer and just try to re-establish the connection
-        console.log("[Reconnection] Attempting to reconnect creator with existing session ID: ", creatorSessionId);
-        
-        // Close old connection
-        if (oldPeer) {
-          try {
-            oldPeer.close();
-          } catch (err) {
-            console.error("[Reconnection] Error closing old peer:", err);
-          }
-        }
-        
-        // Create a new connection but preserve the session ID
-        const { creatorPeer, dataChannel, sessionId, sendReliableMessage } = await createConnection();
-        
-        // Check if we got the same session ID back
-        if (sessionId !== creatorSessionId) {
-          console.warn("[Reconnection] Warning: Reconnected with new session ID. Original:", creatorSessionId, "New:", sessionId);
-        }
-        
-        // Store new connection objects
-        creatorPeerRef.current.set(sessionId, creatorPeer);
-        dataChannelRef.current.set(sessionId, dataChannel);
-        
-        // Only update session ID if it's different
-        if (sessionId !== creatorSessionId) {
-          setCreatorSessionId(sessionId);
-        }
-        
-        // Store the reliable message sender
-        reliableSenderRef.current = sendReliableMessage;
-        
-        // Set up new event handlers - calling setupDataChannel directly
-        // Since the function sets up handlers directly on the channel, no need to assign return value
-        setupDataChannel(dataChannel);
-        
-        // Start heartbeat with new channel
-        startHeartbeat(dataChannel, sendReliableMessage);
-        
-        console.log("[Reconnection] Connection reestablished successfully");
-        setConnectionStatus('connected');
-        setHeartbeatStatus('connected');
-        setError(null);
-      } else if (mode === 'participant' && sessionId) {
-        // For participant, use the original sessionId for reconnection
+      if (mode === 'creator') {
+        await handleCreateQuiz();
+      } else if (mode === 'participant') {
         const sessionToUse = originalSessionIdRef.current || sessionId;
-        console.log("[Reconnection] Participant attempting to rejoin with consistent session ID:", sessionToUse);
-        
-        // Join the session with existing participant ID to maintain consistency
-        const { participantPeer, getChannel, sendReliableMessage } = await joinConnection(
-          sessionToUse,
-          participantId
-        );
-        
-        // Store the new participant peer
-        participantPeerRef.current = participantPeer;
-        
-        // Get the data channel
-        const channel = getChannel();
-        participantChannelRef.current = channel;
-        
-        // Set up data channel - call the function directly rather than using its return value
-        setupDataChannel(channel);
-        
-        // Start heartbeat
-        startHeartbeat(channel, sendReliableMessage);
-        
-        console.log("[Reconnection] Participant reconnected successfully");
-        setConnectionStatus('connected');
-        setHeartbeatStatus('connected');
+        if (sessionToUse) {
+          await handleJoinQuiz(sessionToUse);
+        }
       }
-    } catch (err: any) { // Type the error as 'any' to access message property
-      console.error("[Reconnection] Failed to reconnect:", err);
-      setError(`Reconnection failed: ${err?.message || 'Unknown error'}. Please try again or refresh the page.`);
-    } finally {
-      setIsLoading(false);
+    } catch (err) {
+      console.error('[Reconnection] Failed to reconnect:', err);
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      setError(`Reconnection failed: ${message}. Please try again or refresh the page.`);
     }
-  }, [mode, creatorSessionId, sessionId, setupDataChannel, startHeartbeat, participantId]);
+    // handleCreateQuiz/handleJoinQuiz manage isLoading themselves.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, sessionId]);
 
-  // Add effect to monitor connection status and trigger reconnection
+  // Auto-reconnect after a sustained outage. The P2P layer already performs
+  // ICE restarts internally, so we only redo the signaling handshake if the
+  // connection has been down long enough that recovery has clearly failed.
   useEffect(() => {
-    // Only attempt automatic reconnection if we've been disconnected for a while
     if (connectionStatus === 'disconnected' || heartbeatStatus === 'disconnected') {
       const timer = setTimeout(() => {
-        console.log("[Auto-reconnect] Connection has been down, attempting reconnection");
-        attemptReconnection();
-      }, 15000); // Wait 15 seconds before attempting reconnection
-      
+        console.log('[Auto-reconnect] Connection has been down, attempting reconnection');
+        void attemptReconnection();
+      }, 15000);
+
       return () => clearTimeout(timer);
     }
   }, [connectionStatus, heartbeatStatus, attemptReconnection]);
@@ -1189,26 +1119,20 @@ function HomePageContent() {
   );
 }
 
-export default function HomePage() {
-  return (
-    <Suspense fallback={
-      <div className="min-h-screen p-4 md:p-8 bg-gradient-to-br from-indigo-50 via-indigo-100 to-white flex items-center justify-center">
-        <div className="text-center">
-          <div className="inline-block animate-spin rounded-full h-10 w-10 border-4 border-indigo-300 border-t-indigo-600 mb-4"></div>
-          <p className="text-indigo-800 font-medium text-lg">Loading...</p>
-        </div>
-      </div>
-    }>
-      <HomeContent />
-    </Suspense>
-  );
-}
-
 // `useSearchParams` suspends on the client; wrap to satisfy Next.js's
 // prerender contract and avoid a CSR bailout during build.
 export default function HomePage() {
   return (
-    <Suspense fallback={null}>
+    <Suspense
+      fallback={
+        <div className="min-h-screen p-4 md:p-8 bg-gradient-to-br from-indigo-50 via-indigo-100 to-white flex items-center justify-center">
+          <div className="text-center">
+            <div className="inline-block animate-spin rounded-full h-10 w-10 border-4 border-indigo-300 border-t-indigo-600 mb-4"></div>
+            <p className="text-indigo-800 font-medium text-lg">Loading...</p>
+          </div>
+        </div>
+      }
+    >
       <HomePageContent />
     </Suspense>
   );
