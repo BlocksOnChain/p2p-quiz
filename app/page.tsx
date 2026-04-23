@@ -6,6 +6,7 @@ import { useSearchParams } from 'next/navigation';
 import { Inter } from 'next/font/google';
 import { QRCodeSVG } from 'qrcode.react';
 import { getHostAddress } from '@/lib/utils';
+import P2PStatus from '@/app/components/p2p-status';
 
 const inter = Inter({ subsets: ['latin'] });
 
@@ -135,7 +136,7 @@ function HomePageContent() {
         heartbeatIntervalRef.current = null;
       }
     };
-  }, []);
+  }, [creatorSessionId, connectionStatus, heartbeatStatus]);
 
   // Shared wiring of a P2PConnection to React state: connection/channel
   // state indicators and the common bookkeeping every screen needs.
@@ -338,10 +339,16 @@ function HomePageContent() {
   const [currentQuizId, setCurrentQuizId] = useState<string | null>(null);
   const [myAnswers, setMyAnswers] = useState<Map<string, string>>(new Map());
   const [participantId] = useState(() => Math.random().toString(36).substring(2));
+  // Store the original session ID to maintain connection across reconnects
+  const originalSessionIdRef = useRef<string | null>(null);
 
   // Join quiz when session ID is present
   useEffect(() => {
     if (sessionId && mode === 'participant') {
+      // Store the original session ID
+      if (!originalSessionIdRef.current) {
+        originalSessionIdRef.current = sessionId;
+      }
       handleJoinQuiz(sessionId);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -579,13 +586,13 @@ function HomePageContent() {
                     <input
                       readOnly
                       className="flex-1 px-4 py-3 bg-white border-2 border-indigo-300 rounded-lg shadow-sm text-indigo-900 font-medium"
-                      value={hostAddress ? `http://${hostAddress}/?session=${creatorSessionId}` : 'Loading link...'}
+                      value={hostAddress ? `${hostAddress}/?session=${creatorSessionId}` : 'Loading link...'}
                     />
                     <button
                       onClick={() => {
                         if (hostAddress) {
                           navigator.clipboard.writeText(
-                            `http://${hostAddress}/?session=${creatorSessionId}`
+                            `${hostAddress}/?session=${creatorSessionId}`
                           );
                           alert('Link copied!');
                         }
@@ -611,7 +618,7 @@ function HomePageContent() {
                   <p className="text-sm font-medium text-indigo-700 mb-3">Or scan QR code:</p>
                   {hostAddress ? (
                     <QRCodeSVG 
-                      value={`http://${hostAddress}/?session=${creatorSessionId}`}
+                      value={`${hostAddress}/?session=${creatorSessionId}`}
                       size={150}
                       bgColor={"#ffffff"}
                       fgColor={"#4f46e5"}
@@ -796,45 +803,6 @@ function HomePageContent() {
     </div>
   );
 
-  // Add connection status indicator component
-  const renderConnectionStatus = () => {
-    return (
-      <div className="flex items-center gap-2">
-        <div className={`w-3 h-3 rounded-full ${
-          connectionStatus === 'connected' 
-            ? heartbeatStatus === 'connected' 
-              ? 'bg-green-500 animate-pulse' 
-              : heartbeatStatus === 'reconnecting' 
-                ? 'bg-yellow-500 animate-pulse' 
-                : 'bg-red-500 animate-pulse'
-            : 'bg-red-500 animate-pulse'
-        }`}></div>
-        <span className={`${
-          connectionStatus === 'connected' 
-            ? heartbeatStatus === 'connected' 
-              ? 'text-green-600' 
-              : heartbeatStatus === 'reconnecting' 
-                ? 'text-yellow-600' 
-                : 'text-red-600'
-            : 'text-red-600'
-        } font-semibold`}>
-          {connectionStatus === 'connected' 
-            ? heartbeatStatus === 'connected' 
-              ? 'Connected' 
-              : heartbeatStatus === 'reconnecting' 
-                ? 'Reconnecting...' 
-                : 'Connection unstable'
-            : connectionStatus === 'connecting' 
-              ? 'Connecting...' 
-              : 'Disconnected'
-          }
-          {messageSendingStatus === 'sending' && ' (Sending...)'}
-          {messageSendingStatus === 'failed' && ' (Send failed)'}
-        </span>
-      </div>
-    );
-  };
-
   // Add timer display for participants
   const renderTimer = () => {
     if (!currentQuiz?.timeLimit || quizTimer === null) return null;
@@ -970,88 +938,207 @@ function HomePageContent() {
     );
   };
 
+  // Add a reconnection function
+  const attemptReconnection = useCallback(async () => {
+    console.log("[Reconnection] Attempting to reestablish connection");
+    setIsLoading(true);
+    
+    try {
+      // Only attempt reconnection if we're in creator mode and have a session ID
+      if (mode === 'creator' && creatorSessionId) {
+        // Check if the old connection is still usable
+        const oldPeer = creatorPeerRef.current.get(creatorSessionId);
+        if (oldPeer && 
+            (oldPeer.connectionState === 'connected' || oldPeer.iceConnectionState === 'connected')) {
+          console.log("[Reconnection] Existing connection still appears valid, skipping reconnection");
+          setConnectionStatus('connected');
+          setHeartbeatStatus('connected');
+          setIsLoading(false);
+          return;
+        }
+        
+        // For creator, if we're reconnecting we should use createConnection without expecting a new sessionId
+        // This ensures we keep using the same peer and just try to re-establish the connection
+        console.log("[Reconnection] Attempting to reconnect creator with existing session ID: ", creatorSessionId);
+        
+        // Close old connection
+        if (oldPeer) {
+          try {
+            oldPeer.close();
+          } catch (err) {
+            console.error("[Reconnection] Error closing old peer:", err);
+          }
+        }
+        
+        // Create a new connection but preserve the session ID
+        const { creatorPeer, dataChannel, sessionId, sendReliableMessage } = await createConnection();
+        
+        // Check if we got the same session ID back
+        if (sessionId !== creatorSessionId) {
+          console.warn("[Reconnection] Warning: Reconnected with new session ID. Original:", creatorSessionId, "New:", sessionId);
+        }
+        
+        // Store new connection objects
+        creatorPeerRef.current.set(sessionId, creatorPeer);
+        dataChannelRef.current.set(sessionId, dataChannel);
+        
+        // Only update session ID if it's different
+        if (sessionId !== creatorSessionId) {
+          setCreatorSessionId(sessionId);
+        }
+        
+        // Store the reliable message sender
+        reliableSenderRef.current = sendReliableMessage;
+        
+        // Set up new event handlers - calling setupDataChannel directly
+        // Since the function sets up handlers directly on the channel, no need to assign return value
+        setupDataChannel(dataChannel);
+        
+        // Start heartbeat with new channel
+        startHeartbeat(dataChannel, sendReliableMessage);
+        
+        console.log("[Reconnection] Connection reestablished successfully");
+        setConnectionStatus('connected');
+        setHeartbeatStatus('connected');
+        setError(null);
+      } else if (mode === 'participant' && sessionId) {
+        // For participant, use the original sessionId for reconnection
+        const sessionToUse = originalSessionIdRef.current || sessionId;
+        console.log("[Reconnection] Participant attempting to rejoin with consistent session ID:", sessionToUse);
+        
+        // Join the session with existing participant ID to maintain consistency
+        const { participantPeer, getChannel, sendReliableMessage } = await joinConnection(
+          sessionToUse,
+          participantId
+        );
+        
+        // Store the new participant peer
+        participantPeerRef.current = participantPeer;
+        
+        // Get the data channel
+        const channel = getChannel();
+        participantChannelRef.current = channel;
+        
+        // Set up data channel - call the function directly rather than using its return value
+        setupDataChannel(channel);
+        
+        // Start heartbeat
+        startHeartbeat(channel, sendReliableMessage);
+        
+        console.log("[Reconnection] Participant reconnected successfully");
+        setConnectionStatus('connected');
+        setHeartbeatStatus('connected');
+      }
+    } catch (err: any) { // Type the error as 'any' to access message property
+      console.error("[Reconnection] Failed to reconnect:", err);
+      setError(`Reconnection failed: ${err?.message || 'Unknown error'}. Please try again or refresh the page.`);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [mode, creatorSessionId, sessionId, setupDataChannel, startHeartbeat, participantId]);
+
+  // Add effect to monitor connection status and trigger reconnection
+  useEffect(() => {
+    // Only attempt automatic reconnection if we've been disconnected for a while
+    if (connectionStatus === 'disconnected' || heartbeatStatus === 'disconnected') {
+      const timer = setTimeout(() => {
+        console.log("[Auto-reconnect] Connection has been down, attempting reconnection");
+        attemptReconnection();
+      }, 15000); // Wait 15 seconds before attempting reconnection
+      
+      return () => clearTimeout(timer);
+    }
+  }, [connectionStatus, heartbeatStatus, attemptReconnection]);
+
+  // Update the return statement to use the P2PStatus component
   return (
-    <main className={`min-h-screen p-4 md:p-8 bg-gradient-to-br from-indigo-50 via-indigo-100 to-white ${inter.className}`}>
-      <div className="max-w-4xl mx-auto">
-        <h1 className="text-3xl md:text-4xl font-bold mb-6 md:mb-8 text-indigo-900 text-center">
-          Real-Time P2P Quiz
-        </h1>
+    <div className="min-h-screen pb-16">
+      {/* Add the P2PStatus component at the top, outside the main content */}
+      <P2PStatus
+        connectionStatus={connectionStatus}
+        heartbeatStatus={heartbeatStatus}
+        messageSendingStatus={messageSendingStatus}
+        isLoading={isLoading}
+        onReconnect={attemptReconnection}
+      />
+      
+      <main className={`min-h-screen p-4 pt-20 md:p-8 md:pt-24 bg-gradient-to-br from-indigo-50 via-indigo-100 to-white ${inter.className}`}>
+        <div className="max-w-4xl mx-auto">
+          <h1 className="text-3xl md:text-4xl font-bold mb-6 md:mb-8 text-indigo-900 text-center">
+            Real-Time P2P Quiz
+          </h1>
 
-        {error && (
-          <div className="mb-6 p-4 bg-red-50 border-2 border-red-200 rounded-lg shadow-sm">
-            <p className="text-red-800 font-medium">{error}</p>
-          </div>
-        )}
+          {error && (
+            <div className="error-message bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">
+              <strong className="font-bold">Error: </strong>
+              <span className="block sm:inline">{error}</span>
+            </div>
+          )}
 
-        <div className="bg-white rounded-xl shadow-lg p-6 md:p-8 mb-8 border border-gray-100">
-          <div className="flex flex-col md:flex-row md:items-center gap-4 mb-6 border-b border-gray-100 pb-4">
-            <div className="flex-1">
-              <h2 className="text-xl font-bold text-indigo-900 mb-1">
-                {mode === 'creator' ? 'Quiz Creator' : 'Quiz Participant'}
-              </h2>
-              <div className="flex items-center mt-2">
-                {renderConnectionStatus()}
+          <div className="bg-white rounded-xl shadow-lg p-6 md:p-8 mb-8 border border-gray-100">
+            <div className="flex flex-col md:flex-row md:items-center gap-4 mb-6 border-b border-gray-100 pb-4">
+              <div className="flex-1">
+                <h2 className="text-xl font-bold text-indigo-900 mb-1">
+                  {mode === 'creator' ? 'Quiz Creator' : 'Quiz Participant'}
+                </h2>
               </div>
+              {!sessionId && (
+                <button
+                  onClick={() => setMode(mode === 'creator' ? 'participant' : 'creator')}
+                  className="px-5 py-2.5 text-sm font-medium text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-lg hover:bg-indigo-100 transition-colors"
+                >
+                  Switch to {mode === 'creator' ? 'Participant' : 'Creator'} Mode
+                </button>
+              )}
             </div>
-            {!sessionId && (
-              <button
-                onClick={() => setMode(mode === 'creator' ? 'participant' : 'creator')}
-                className="px-5 py-2.5 text-sm font-medium text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-lg hover:bg-indigo-100 transition-colors"
-              >
-                Switch to {mode === 'creator' ? 'Participant' : 'Creator'} Mode
-              </button>
-            )}
-          </div>
 
-          {isLoading ? (
-            <div className="text-center py-12">
-              <div className="inline-block animate-spin rounded-full h-10 w-10 border-4 border-indigo-300 border-t-indigo-600 mb-4"></div>
-              <p className="text-indigo-800 font-medium text-lg">
-                {mode === 'creator' ? 'Creating quiz session...' : 'Joining quiz session...'}
-              </p>
-              <p className="text-gray-500 mt-2">This may take a few moments</p>
-            </div>
-          ) : mode === 'creator' ? (
-            renderCreatorUI()
-          ) : (
+            {isLoading ? (
+              <div className="text-center py-12">
+                <div className="inline-block animate-spin rounded-full h-10 w-10 border-4 border-indigo-300 border-t-indigo-600 mb-4"></div>
+                <p className="text-indigo-800 font-medium text-lg">
+                  {mode === 'creator' ? 'Creating quiz session...' : 'Joining quiz session...'}
+                </p>
+                <p className="text-gray-500 mt-2">This may take a few moments</p>
+              </div>
+            ) : mode === 'creator' ? (
+              renderCreatorUI()
+            ) : (
               <div className="space-y-6">
-              {receivedQuizzes.length > 0 ? (
-                <>
-                  {/* Quiz Navigation */}
-                  {receivedQuizzes.length > 1 && (
-                    <div className="mb-6">
-                      <h3 className="text-base font-medium text-gray-700 mb-3">Select a Question:</h3>
-                      <div className="flex gap-2 flex-wrap">
-                        {receivedQuizzes.map((quiz, index) => {
-                          const hasAnswer = scores.has(quiz.id);
-                          return (
-                            <button
-                              key={quiz.id}
-                              onClick={() => setCurrentQuizId(quiz.id)}
-                              className={`px-4 py-2 rounded-lg transition-all ${
-                                currentQuizId === quiz.id
+                {receivedQuizzes.length > 0 ? (
+                  <>
+                    {/* Quiz Navigation */}
+                    {receivedQuizzes.length > 1 && (
+                      <div className="mb-6">
+                        <h3 className="text-base font-medium text-gray-700 mb-3">Select a Question:</h3>
+                        <div className="flex gap-2 flex-wrap">
+                          {receivedQuizzes.map((quiz, index) => {
+                            const hasAnswer = scores.has(quiz.id);
+                            return (
+                              <button
+                                key={quiz.id}
+                                onClick={() => setCurrentQuizId(quiz.id)}
+                                className={`px-4 py-2 rounded-lg transition-all ${currentQuizId === quiz.id
                                   ? 'bg-indigo-600 text-white shadow-md'
                                   : hasAnswer
                                     ? 'bg-green-100 text-green-800 border border-green-300'
                                     : 'bg-gray-100 text-gray-700 hover:bg-gray-200 border border-gray-200'
-                              }`}
-                            >
-                              Q{index + 1}
-                              {hasAnswer && (
-                                <svg className="w-4 h-4 ml-1 inline-block" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                                </svg>
-                              )}
-                            </button>
-                          );
-                        })}
+                                }`}
+                              >
+                                Q{index + 1}
+                                {hasAnswer && (
+                                  <svg className="w-4 h-4 ml-1 inline-block" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                                  </svg>
+                                )}
+                              </button>
+                            );
+                          })}
+                        </div>
                       </div>
-                    </div>
-                  )}
+                    )}
 
-                  {/* Current Quiz */}
-                  {renderCurrentQuiz()}
-                </>
+                    {renderCurrentQuiz()}
+                  </>
                 ) : connectionStatus === 'connected' ? (
                   <div className="text-center py-16">
                     <div className="w-24 h-24 mx-auto mb-6 rounded-full bg-indigo-100 flex items-center justify-center">
@@ -1094,14 +1181,26 @@ function HomePageContent() {
                   </div>
                 )}
               </div>
-          )}
+            )}
+          </div>
         </div>
-        
-        <footer className="text-center text-sm text-gray-500 mt-8 pb-6">
-          <p>Real-Time P2P Quiz | Powered by WebRTC</p>
-        </footer>
+      </main>
+    </div>
+  );
+}
+
+export default function HomePage() {
+  return (
+    <Suspense fallback={
+      <div className="min-h-screen p-4 md:p-8 bg-gradient-to-br from-indigo-50 via-indigo-100 to-white flex items-center justify-center">
+        <div className="text-center">
+          <div className="inline-block animate-spin rounded-full h-10 w-10 border-4 border-indigo-300 border-t-indigo-600 mb-4"></div>
+          <p className="text-indigo-800 font-medium text-lg">Loading...</p>
+        </div>
       </div>
-    </main>
+    }>
+      <HomeContent />
+    </Suspense>
   );
 }
 
